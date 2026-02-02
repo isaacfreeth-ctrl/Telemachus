@@ -181,7 +181,12 @@ def fetch_eu_data(org_id: str) -> dict:
     
     print(f"  Found {len(registrations)} registration snapshots, {len(meetings)} Commission meetings")
     
-    return {"registrations": registrations, "meetings": meetings, "org_id": org_id}
+    return {
+        "registrations": registrations, 
+        "meetings": meetings, 
+        "org_id": org_id,
+        "data_coverage": "2012-present"
+    }
 
 
 def fetch_france_data(org_id: str) -> dict:
@@ -243,7 +248,8 @@ def fetch_france_data(org_id: str) -> dict:
         "activities": activities,
         "officials": officials,
         "decisions": decisions,
-        "org_id": org_id
+        "org_id": org_id,
+        "data_coverage": "2017-present"
     }
 
 
@@ -333,6 +339,9 @@ def fetch_germany_data(register_number: str, entry_id: str = None) -> dict:
         "version_count": len(versions),
         "first_publication": data.get("accountDetails", {}).get("firstPublicationDate", ""),
         "last_update": data.get("accountDetails", {}).get("lastUpdateDate", ""),
+        
+        # Data coverage
+        "data_coverage": "2022-present",
         
         # Raw data for Excel
         "_raw": data
@@ -467,70 +476,132 @@ def print_ireland_instructions():
     """)
 
 
-# UK GOV.UK CKAN API for ministerial transparency data
-UK_CKAN_API = "https://ckan.publishing.service.gov.uk/api/3/action"
+# UK GOV.UK Search API and Content API for ministerial transparency data
+UK_GOVUK_SEARCH_API = "https://www.gov.uk/api/search.json"
+UK_GOVUK_CONTENT_API = "https://www.gov.uk/api/content"
 UK_MEETINGS_CACHE_DIR = Path.home() / ".cache" / "eu_lobbying" / "uk_meetings"
-
-# Known recent UK ministerial meetings CSV URLs (GOV.UK assets)
-# These are direct links to recent transparency publications that may not be in CKAN yet
-UK_RECENT_CSVS = [
-    # DSIT (Department for Science, Innovation and Technology) - key for tech companies
-    ("DSIT", "https://assets.publishing.service.gov.uk/media/688c722c6c7eb66caea94e09/dsit-ministerial-meetings-january-march-2025.csv"),
-    ("DSIT", "https://assets.publishing.service.gov.uk/media/67e54145a82c168e578c9b8e/dsit-ministerial-meetings-october-december-2024.csv"),
-    ("DSIT", "https://assets.publishing.service.gov.uk/media/679b6625abe77b74cc146c35/dsit-ministerial-meetings-july-september-2024.csv"),
-    ("DSIT", "https://assets.publishing.service.gov.uk/media/6706e80b3783cd364f9b4edb/dsit-ministerial-meetings-april-june-2024.csv"),
-    # DCMS (Department for Culture, Media and Sport)
-    ("DCMS", "https://assets.publishing.service.gov.uk/media/67e69d338ac59d1882eaddde/DCMS_Q3_2024_Ministers_Meetings.csv"),
-    ("DCMS", "https://assets.publishing.service.gov.uk/media/679b816415f01fdf8e05e7ee/DCMS_Ministers__Meetings_1_July_to_30_Sep_2024.csv"),
-    # Treasury
-    ("HM Treasury", "https://assets.publishing.service.gov.uk/media/67e6a0da8ac59d1882eaddf9/Treasury_Ministerial_Transparency_Meetings_Oct-Dec_2024.csv"),
-    ("HM Treasury", "https://assets.publishing.service.gov.uk/media/679b859115f01fdf8e05e80a/Treasury_Ministerial_Transparency_Meetings_July-Sept_2024.csv"),
-    # Cabinet Office
-    ("Cabinet Office", "https://assets.publishing.service.gov.uk/media/67e6a0e68ac59d1882eaddfc/Cabinet_Office_Ministerial_Meetings_Oct-Dec_2024.csv"),
-    ("Cabinet Office", "https://assets.publishing.service.gov.uk/media/679b86ee15f01fdf8e05e81a/Cabinet_Office_Ministerial_Meetings_Jul-Sept_2024.csv"),
-    # Home Office
-    ("Home Office", "https://assets.publishing.service.gov.uk/media/67e6a0f58ac59d1882eaddfe/Home_Office_Ministerial_Meetings_Oct-Dec_2024.csv"),
-    # DBT (Department for Business and Trade)
-    ("DBT", "https://assets.publishing.service.gov.uk/media/67e6a12c8ac59d1882eade04/DBT_Ministerial_Meetings_Oct-Dec_2024.csv"),
-    # DESNZ (Department for Energy Security and Net Zero)
-    ("DESNZ", "https://assets.publishing.service.gov.uk/media/685a7935454906840a44d5ce/desnz-jan-mar-2025-ministers-meetings.csv"),
-    ("DESNZ", "https://assets.publishing.service.gov.uk/media/67e6a1548ac59d1882eade09/DESNZ_Ministerial_Meetings_Oct-Dec_2024.csv"),
-]
+UK_PUBLICATIONS_CACHE = Path.home() / ".cache" / "eu_lobbying" / "uk_publications_index.json"
 
 
-def get_uk_ministerial_datasets() -> list:
-    """Get list of UK ministerial meetings datasets from data.gov.uk CKAN API."""
-    print("Fetching UK ministerial meetings datasets from data.gov.uk...")
+def discover_uk_transparency_publications(max_results: int = 500) -> list:
+    """
+    Dynamically discover all UK ministerial meetings transparency publications
+    using the GOV.UK Search API.
     
-    # Search for ministerial meetings datasets
-    url = f"{UK_CKAN_API}/package_search"
-    params = {"q": "ministerial meetings transparency", "rows": 100}
+    Returns list of publication paths that can be fetched via Content API.
+    Results are cached for 24 hours.
+    """
+    UK_MEETINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check cache first
+    if UK_PUBLICATIONS_CACHE.exists():
+        cache_age = datetime.now().timestamp() - UK_PUBLICATIONS_CACHE.stat().st_mtime
+        if cache_age < 86400:  # 24 hours
+            try:
+                with open(UK_PUBLICATIONS_CACHE, 'r') as f:
+                    cached = json.load(f)
+                    if cached.get('publications'):
+                        return cached['publications']
+            except:
+                pass
+    
+    print("  Discovering UK transparency publications via GOV.UK Search API...")
+    
+    publications = []
+    start = 0
+    batch_size = 100  # GOV.UK API max is 1500, but we paginate
+    
+    while start < max_results:
+        params = {
+            "filter_format": "transparency",
+            "q": "ministerial meetings",
+            "count": batch_size,
+            "start": start,
+            "fields": "title,link,organisations,public_timestamp"
+        }
+        
+        try:
+            response = requests.get(UK_GOVUK_SEARCH_API, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("results", [])
+            if not results:
+                break
+                
+            for r in results:
+                title = r.get("title", "").lower()
+                # Filter for meetings publications (not travel, gifts, hospitality only)
+                if "meeting" in title:
+                    org = ""
+                    orgs = r.get("organisations", [])
+                    if orgs and isinstance(orgs, list) and len(orgs) > 0:
+                        org = orgs[0].get("title", "") if isinstance(orgs[0], dict) else ""
+                    
+                    publications.append({
+                        "title": r.get("title", ""),
+                        "link": r.get("link", ""),
+                        "organisation": org,
+                        "date": r.get("public_timestamp", "")
+                    })
+            
+            start += batch_size
+            
+            # If we got fewer results than requested, we've reached the end
+            if len(results) < batch_size:
+                break
+                
+        except Exception as e:
+            print(f"  Warning: Error fetching publications page {start}: {e}")
+            break
+    
+    # Cache the results
+    try:
+        with open(UK_PUBLICATIONS_CACHE, 'w') as f:
+            json.dump({"publications": publications, "timestamp": datetime.now().isoformat()}, f)
+    except:
+        pass
+    
+    print(f"  Found {len(publications)} ministerial meetings publications")
+    return publications
+
+
+def get_csv_urls_from_publication(publication_path: str) -> list:
+    """
+    Fetch a publication from GOV.UK Content API and extract CSV URLs.
+    
+    Returns list of tuples: (department, csv_url)
+    """
+    csv_urls = []
     
     try:
-        response = requests.get(url, params=params, timeout=60)
+        url = f"{UK_GOVUK_CONTENT_API}{publication_path}"
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
         
-        datasets = []
-        if data.get("success") and data.get("result", {}).get("results"):
-            for pkg in data["result"]["results"]:
-                # Get CSV resources
-                csv_resources = [
-                    r for r in pkg.get("resources", [])
-                    if r.get("format", "").upper() == "CSV" and r.get("url")
-                ]
-                if csv_resources:
-                    datasets.append({
-                        "name": pkg.get("name", ""),
-                        "title": pkg.get("title", ""),
-                        "organization": pkg.get("organization", {}).get("title", ""),
-                        "resources": csv_resources
-                    })
+        # Get organisation name
+        orgs = data.get("links", {}).get("organisations", [])
+        org_name = orgs[0].get("title", "Unknown") if orgs else "Unknown"
         
-        return datasets
+        # Extract CSV URLs from the documents HTML
+        details = data.get("details", {})
+        documents = details.get("documents", [])
+        
+        for doc in documents:
+            # Documents contain HTML with attachment links
+            # Extract URLs ending in .csv from href attributes
+            urls = re.findall(r'href="(https://assets\.publishing\.service\.gov\.uk/[^"]+\.csv)"', doc)
+            for csv_url in urls:
+                # Only include meetings CSVs, not travel/gifts
+                csv_lower = csv_url.lower()
+                if 'meeting' in csv_lower and 'travel' not in csv_lower:
+                    csv_urls.append((org_name, csv_url))
+        
     except Exception as e:
-        print(f"  Warning: Could not fetch from CKAN API: {e}")
-        return []
+        pass  # Skip problematic publications silently
+    
+    return csv_urls
 
 
 def download_uk_meetings_csv(url: str, cache_key: str) -> str:
@@ -552,24 +623,35 @@ def download_uk_meetings_csv(url: str, cache_key: str) -> str:
 
 
 def parse_uk_csv_for_matches(csv_path: str, search_lower: str, dept: str) -> list:
-    """Parse a UK ministerial meetings CSV and return matching rows."""
+    """Parse a UK ministerial/senior officials meetings CSV and return matching rows."""
     matches = []
     try:
         with open(csv_path, 'r', encoding='utf-8-sig', errors='replace') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Search in organisation name and purpose - handle various column names
-                org_name = (row.get('Name of Individual or Organisation') or 
-                           row.get('Name of organisation or individual') or 
-                           row.get('Organisation') or '')
-                purpose = (row.get('Purpose of Meeting') or 
-                          row.get('Purpose of meeting') or 
-                          row.get('Purpose') or '')
+                # Search in organisation name and purpose - handle various column names (case-insensitive)
+                # Create lowercase key lookup
+                row_lower = {k.lower(): v for k, v in row.items()}
+                
+                org_name = (row_lower.get('name of individual or organisation') or 
+                           row_lower.get('name of organisation or individual') or 
+                           row_lower.get('organisation') or 
+                           row_lower.get('name of organisation') or '')
+                purpose = (row_lower.get('purpose of meeting') or 
+                          row_lower.get('purpose') or '')
+                
+                # Get official name - could be Minister or Senior Official
+                official = (row_lower.get('minister') or 
+                           row_lower.get("senior official's name") or
+                           row_lower.get('senior official') or
+                           row_lower.get('name') or '')
+                
+                date = row_lower.get('date', '')
                 
                 if search_lower in org_name.lower() or search_lower in purpose.lower():
                     matches.append({
-                        "minister": row.get('Minister', ''),
-                        "date": row.get('Date', ''),
+                        "minister": official,
+                        "date": date,
                         "organisation": org_name,
                         "purpose": purpose,
                         "department": dept,
@@ -580,60 +662,296 @@ def parse_uk_csv_for_matches(csv_path: str, search_lower: str, dept: str) -> lis
     return matches
 
 
-def search_uk_ministerial_meetings(search_term: str, max_datasets: int = 20) -> dict:
+UK_SENIOR_OFFICIALS_CACHE = Path.home() / ".cache" / "eu_lobbying" / "uk_senior_officials_index.json"
+
+
+def discover_uk_senior_officials_publications(max_results: int = 300) -> list:
+    """
+    Dynamically discover UK senior officials meetings transparency publications
+    using the GOV.UK Search API.
+    
+    Returns list of publication paths that can be fetched via Content API.
+    Results are cached for 24 hours.
+    """
+    UK_MEETINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check cache first
+    if UK_SENIOR_OFFICIALS_CACHE.exists():
+        cache_age = datetime.now().timestamp() - UK_SENIOR_OFFICIALS_CACHE.stat().st_mtime
+        if cache_age < 86400:  # 24 hours
+            try:
+                with open(UK_SENIOR_OFFICIALS_CACHE, 'r') as f:
+                    cached = json.load(f)
+                    if cached.get('publications'):
+                        return cached['publications']
+            except:
+                pass
+    
+    print("  Discovering UK senior officials publications via GOV.UK Search API...")
+    
+    publications = []
+    start = 0
+    batch_size = 100
+    
+    while start < max_results:
+        params = {
+            "filter_format": "transparency",
+            "q": "senior officials meetings",
+            "count": batch_size,
+            "start": start,
+            "fields": "title,link,organisations,public_timestamp"
+        }
+        
+        try:
+            response = requests.get(UK_GOVUK_SEARCH_API, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("results", [])
+            if not results:
+                break
+                
+            for r in results:
+                title = r.get("title", "").lower()
+                # Filter for meetings publications (not expenses, hospitality only)
+                if "meeting" in title and "senior official" in title:
+                    org = ""
+                    orgs = r.get("organisations", [])
+                    if orgs and isinstance(orgs, list) and len(orgs) > 0:
+                        org = orgs[0].get("title", "") if isinstance(orgs[0], dict) else ""
+                    
+                    publications.append({
+                        "title": r.get("title", ""),
+                        "link": r.get("link", ""),
+                        "organisation": org,
+                        "date": r.get("public_timestamp", "")
+                    })
+            
+            start += batch_size
+            
+            if len(results) < batch_size:
+                break
+                
+        except Exception as e:
+            print(f"  Warning: Error fetching senior officials page {start}: {e}")
+            break
+    
+    # Cache the results
+    try:
+        with open(UK_SENIOR_OFFICIALS_CACHE, 'w') as f:
+            json.dump({"publications": publications, "timestamp": datetime.now().isoformat()}, f)
+    except:
+        pass
+    
+    print(f"  Found {len(publications)} senior officials meetings publications")
+    return publications
+
+
+def get_senior_officials_csv_urls_from_publication(publication_path: str) -> list:
+    """
+    Fetch a senior officials publication from GOV.UK Content API and extract CSV URLs.
+    
+    Returns list of tuples: (department, csv_url, is_senior_official)
+    """
+    csv_urls = []
+    
+    try:
+        url = f"{UK_GOVUK_CONTENT_API}{publication_path}"
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Get organisation name
+        orgs = data.get("links", {}).get("organisations", [])
+        org_name = orgs[0].get("title", "Unknown") if orgs else "Unknown"
+        
+        # Extract CSV URLs from the documents HTML
+        details = data.get("details", {})
+        documents = details.get("documents", [])
+        
+        for doc in documents:
+            urls = re.findall(r'href="(https://assets\.publishing\.service\.gov\.uk/[^"]+\.csv)"', doc)
+            for csv_url in urls:
+                csv_lower = csv_url.lower()
+                # Only include meetings CSVs, not expenses/hospitality
+                if 'meeting' in csv_lower and 'expense' not in csv_lower and 'hospitality' not in csv_lower:
+                    csv_urls.append((org_name, csv_url, True))  # True = senior official
+        
+    except Exception:
+        pass
+    
+    return csv_urls
+
+
+def search_uk_ministerial_meetings(search_term: str, max_publications: int = 500, include_senior_officials: bool = True) -> dict:
     """
     Search UK ministerial meetings for an organisation.
     
+    This function dynamically discovers all ministerial meetings transparency
+    publications from GOV.UK, then searches their CSV attachments.
+    
     Data source: GOV.UK ministerial transparency publications
     Published quarterly by each government department.
+    Coverage: All UK government departments from 2010 onwards.
+    
+    Args:
+        search_term: Company or organisation name to search for
+        max_publications: Maximum number of ministerial publications to process (default 500)
+        include_senior_officials: Also search senior officials meetings (default True)
+    
+    The discovery is cached for 24 hours to avoid repeated API calls.
     """
     print(f"Searching UK ministerial meetings for '{search_term}'...")
     
     all_meetings = []
     departments_searched = set()
+    csvs_processed = 0
     search_lower = search_term.lower()
     
-    # FIRST: Fetch recent data directly from known GOV.UK URLs (most up-to-date)
-    print(f"  Fetching recent transparency data from GOV.UK...")
-    recent_fetched = 0
-    for dept, url in UK_RECENT_CSVS:
+    # Step 1: Discover all ministerial transparency publications
+    publications = discover_uk_transparency_publications()
+    
+    # Sort by date (most recent first) and limit
+    publications_sorted = sorted(
+        publications, 
+        key=lambda x: x.get("date", ""), 
+        reverse=True
+    )[:max_publications]
+    
+    print(f"  Processing {len(publications_sorted)} ministerial publications...")
+    
+    # Step 2: For each publication, get CSV URLs and search them
+    # We'll cache the CSV URL discovery per publication
+    csv_urls_cache_file = UK_MEETINGS_CACHE_DIR / "csv_urls_cache.json"
+    csv_urls_cache = {}
+    
+    if csv_urls_cache_file.exists():
         try:
-            cache_key = re.sub(r'[^\w]', '_', url.split('/')[-1])[:100]
-            csv_path = download_uk_meetings_csv(url, cache_key)
+            cache_age = datetime.now().timestamp() - csv_urls_cache_file.stat().st_mtime
+            if cache_age < 86400:  # 24 hours
+                with open(csv_urls_cache_file, 'r') as f:
+                    csv_urls_cache = json.load(f)
+        except:
+            pass
+    
+    all_csv_urls = []
+    
+    for pub in publications_sorted:
+        pub_path = pub.get("link", "")
+        if not pub_path:
+            continue
+            
+        # Check cache first
+        if pub_path in csv_urls_cache:
+            csv_urls = csv_urls_cache[pub_path]
+        else:
+            csv_urls = get_csv_urls_from_publication(pub_path)
+            csv_urls_cache[pub_path] = csv_urls
+        
+        all_csv_urls.extend(csv_urls)
+    
+    # Save CSV URLs cache
+    try:
+        with open(csv_urls_cache_file, 'w') as f:
+            json.dump(csv_urls_cache, f)
+    except:
+        pass
+    
+    # Deduplicate CSV URLs (same URL might appear in multiple publications)
+    seen_urls = set()
+    unique_csv_urls = []
+    for dept, url in all_csv_urls:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_csv_urls.append((dept, url))
+    
+    print(f"  Found {len(unique_csv_urls)} unique CSV files to search")
+    
+    # Step 3: Download and search each CSV
+    for dept, csv_url in unique_csv_urls:
+        try:
+            cache_key = re.sub(r'[^\w]', '_', csv_url.split('/')[-1])[:100]
+            csv_path = download_uk_meetings_csv(csv_url, cache_key)
             matches = parse_uk_csv_for_matches(csv_path, search_lower, dept)
             all_meetings.extend(matches)
             departments_searched.add(dept)
-            recent_fetched += 1
-        except Exception:
+            csvs_processed += 1
+        except Exception as e:
             continue  # Skip unavailable files
-    print(f"  Fetched {recent_fetched} recent datasets")
     
-    # SECOND: Also check CKAN API for older/additional datasets
-    datasets = get_uk_ministerial_datasets()
-    print(f"  Found {len(datasets)} additional datasets in CKAN catalogue")
+    print(f"  Processed {csvs_processed} ministerial CSV files")
     
-    # Process CKAN datasets (limit to specified max)
-    datasets_to_process = datasets[:max_datasets]
-    
-    for dataset in datasets_to_process:
-        dept = dataset.get("organization", "Unknown")
-        departments_searched.add(dept)
+    # Step 4: Also search senior officials meetings if requested
+    senior_officials_count = 0
+    if include_senior_officials:
+        print(f"  Searching senior officials meetings...")
+        so_publications = discover_uk_senior_officials_publications()
+        so_publications_sorted = sorted(
+            so_publications,
+            key=lambda x: x.get("date", ""),
+            reverse=True
+        )[:30]  # Limit senior officials to ~30 most recent (roughly 1 year of data)
         
-        # Get the most recent CSV resources (sorted by name, assuming date in name)
-        resources = sorted(dataset.get("resources", []), key=lambda x: x.get("name") or "", reverse=True)[:5]
+        so_csv_urls_cache_file = UK_MEETINGS_CACHE_DIR / "senior_officials_csv_urls_cache.json"
+        so_csv_urls_cache = {}
         
-        for resource in resources:
-            url = resource.get("url", "")
-            if not url:
+        if so_csv_urls_cache_file.exists():
+            try:
+                cache_age = datetime.now().timestamp() - so_csv_urls_cache_file.stat().st_mtime
+                if cache_age < 86400:
+                    with open(so_csv_urls_cache_file, 'r') as f:
+                        so_csv_urls_cache = json.load(f)
+            except:
+                pass
+        
+        so_csv_urls = []
+        for pub in so_publications_sorted:
+            pub_path = pub.get("link", "")
+            if not pub_path:
                 continue
             
+            if pub_path in so_csv_urls_cache:
+                csv_urls_list = so_csv_urls_cache[pub_path]
+            else:
+                csv_urls_list = get_senior_officials_csv_urls_from_publication(pub_path)
+                so_csv_urls_cache[pub_path] = csv_urls_list
+            
+            so_csv_urls.extend(csv_urls_list)
+        
+        # Save cache
+        try:
+            with open(so_csv_urls_cache_file, 'w') as f:
+                json.dump(so_csv_urls_cache, f)
+        except:
+            pass
+        
+        # Deduplicate
+        seen_so_urls = set()
+        unique_so_urls = []
+        for item in so_csv_urls:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                dept, url = item[0], item[1]
+            else:
+                continue
+            if url not in seen_so_urls and url not in seen_urls:
+                seen_so_urls.add(url)
+                unique_so_urls.append((dept, url))
+        
+        print(f"  Found {len(unique_so_urls)} unique senior officials CSV files")
+        
+        for dept, csv_url in unique_so_urls:
             try:
-                cache_key = re.sub(r'[^\w]', '_', url.split('/')[-1])[:100]
-                csv_path = download_uk_meetings_csv(url, cache_key)
-                matches = parse_uk_csv_for_matches(csv_path, search_lower, dept)
+                cache_key = re.sub(r'[^\w]', '_', csv_url.split('/')[-1])[:100]
+                csv_path = download_uk_meetings_csv(csv_url, cache_key)
+                matches = parse_uk_csv_for_matches(csv_path, search_lower, dept + " (Senior Officials)")
                 all_meetings.extend(matches)
+                departments_searched.add(dept)
+                senior_officials_count += len(matches)
+                csvs_processed += 1
             except Exception:
                 continue
+        
+        print(f"  Found {senior_officials_count} senior officials meetings")
     
     if not all_meetings:
         print(f"  No meetings found matching '{search_term}'")
@@ -692,21 +1010,210 @@ def search_uk_ministerial_meetings(search_term: str, max_datasets: int = 20) -> 
         if year:
             by_year[year] = by_year.get(year, 0) + 1
     
+    # Calculate date range from the data
+    years_list = sorted(by_year.keys()) if by_year else []
+    date_range = f"{min(years_list)}-{max(years_list)}" if years_list else "N/A"
+    
     result = {
         "search_term": search_term,
         "meetings": all_meetings,
         "meetings_count": len(all_meetings),
+        "meeting_count": len(all_meetings),  # Alias for compatibility
         "departments_searched": list(departments_searched),
+        "csvs_processed": csvs_processed,
         "by_minister": dict(sorted(by_minister.items(), key=lambda x: -x[1])),
         "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
         "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
-        "note": "UK ministerial meetings data from GOV.UK transparency publications. Does not include lobbying expenditure."
+        "data_coverage": "2022-present (ministerial) + last year (senior officials)",
+        "date_range": date_range,
+        "note": "UK ministerial and senior officials meetings from GOV.UK transparency publications (dynamically discovered). Does not include lobbying expenditure."
     }
     
-    print(f"  Found {result['meetings_count']} ministerial meetings")
+    if include_senior_officials:
+        result["senior_officials_meetings"] = senior_officials_count
+    
+    print(f"  Found {result['meetings_count']} total meetings")
+    if include_senior_officials and senior_officials_count > 0:
+        print(f"    (including {senior_officials_count} senior officials meetings)")
     print(f"  Departments: {len(departments_searched)}")
     if by_minister:
         print(f"  Top ministers: {', '.join(list(by_minister.keys())[:3])}")
+    
+    return result
+
+
+def search_uk_senior_officials_meetings(search_term: str, max_publications: int = 300) -> dict:
+    """
+    Search UK senior officials meetings for an organisation.
+    
+    This function dynamically discovers senior officials meetings transparency
+    publications from GOV.UK, then searches their CSV attachments.
+    
+    Senior officials include: Permanent Secretaries, Directors General,
+    Finance Directors, Commercial Directors, and other SCS2+ grade officials.
+    
+    Data source: GOV.UK senior officials transparency publications
+    Published quarterly by each government department.
+    Coverage: All UK government departments.
+    
+    Args:
+        search_term: Company or organisation name to search for
+        max_publications: Maximum number of publications to process (default 300)
+    
+    The discovery is cached for 24 hours to avoid repeated API calls.
+    """
+    print(f"Searching UK senior officials meetings for '{search_term}'...")
+    
+    all_meetings = []
+    departments_searched = set()
+    csvs_processed = 0
+    search_lower = search_term.lower()
+    
+    # Step 1: Discover senior officials publications
+    publications = discover_uk_senior_officials_publications(max_results=max_publications)
+    
+    publications_sorted = sorted(
+        publications,
+        key=lambda x: x.get("date", ""),
+        reverse=True
+    )[:max_publications]
+    
+    print(f"  Processing {len(publications_sorted)} senior officials publications...")
+    
+    # Step 2: Get CSV URLs with caching
+    csv_urls_cache_file = UK_MEETINGS_CACHE_DIR / "senior_officials_csv_urls_cache.json"
+    csv_urls_cache = {}
+    
+    if csv_urls_cache_file.exists():
+        try:
+            cache_age = datetime.now().timestamp() - csv_urls_cache_file.stat().st_mtime
+            if cache_age < 86400:
+                with open(csv_urls_cache_file, 'r') as f:
+                    csv_urls_cache = json.load(f)
+        except:
+            pass
+    
+    all_csv_urls = []
+    for pub in publications_sorted:
+        pub_path = pub.get("link", "")
+        if not pub_path:
+            continue
+        
+        if pub_path in csv_urls_cache:
+            csv_urls = csv_urls_cache[pub_path]
+        else:
+            csv_urls = get_senior_officials_csv_urls_from_publication(pub_path)
+            csv_urls_cache[pub_path] = csv_urls
+        
+        all_csv_urls.extend(csv_urls)
+    
+    # Save cache
+    try:
+        with open(csv_urls_cache_file, 'w') as f:
+            json.dump(csv_urls_cache, f)
+    except:
+        pass
+    
+    # Deduplicate
+    seen_urls = set()
+    unique_csv_urls = []
+    for item in all_csv_urls:
+        if len(item) == 3:
+            dept, url, _ = item
+        else:
+            dept, url = item
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_csv_urls.append((dept, url))
+    
+    print(f"  Found {len(unique_csv_urls)} unique CSV files to search")
+    
+    # Step 3: Download and search each CSV
+    for dept, csv_url in unique_csv_urls:
+        try:
+            cache_key = re.sub(r'[^\w]', '_', csv_url.split('/')[-1])[:100]
+            csv_path = download_uk_meetings_csv(csv_url, cache_key)
+            matches = parse_uk_csv_for_matches(csv_path, search_lower, dept)
+            all_meetings.extend(matches)
+            departments_searched.add(dept)
+            csvs_processed += 1
+        except Exception:
+            continue
+    
+    print(f"  Processed {csvs_processed} CSV files")
+    
+    if not all_meetings:
+        print(f"  No meetings found matching '{search_term}'")
+        return None
+    
+    # Deduplicate meetings
+    seen = set()
+    unique_meetings = []
+    for m in all_meetings:
+        key = (m.get("minister", ""), m.get("date", ""), m.get("organisation", ""))
+        if key not in seen:
+            seen.add(key)
+            unique_meetings.append(m)
+    
+    all_meetings = unique_meetings
+    
+    # Sort by date
+    def parse_date_for_sort(m):
+        date = m.get("date", "")
+        if "/" in date:
+            parts = date.split("/")
+            if len(parts) == 3:
+                try:
+                    return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                except:
+                    pass
+        if "-" in date and len(date) >= 10:
+            return date[:10]
+        return "0000-00-00"
+    
+    all_meetings.sort(key=parse_date_for_sort, reverse=True)
+    
+    # Aggregate statistics
+    by_official = {}
+    by_department = {}
+    by_year = {}
+    
+    for m in all_meetings:
+        official = m.get("minister", "Unknown")  # Column is often still called "minister"
+        dept = m.get("department", "Unknown")
+        date = m.get("date", "")
+        
+        year = ""
+        if "/" in date:
+            parts = date.split("/")
+            if len(parts) == 3:
+                year = parts[2] if len(parts[2]) == 4 else parts[0]
+        elif "-" in date:
+            year = date[:4]
+        
+        by_official[official] = by_official.get(official, 0) + 1
+        by_department[dept] = by_department.get(dept, 0) + 1
+        if year:
+            by_year[year] = by_year.get(year, 0) + 1
+    
+    result = {
+        "search_term": search_term,
+        "meetings": all_meetings,
+        "meetings_count": len(all_meetings),
+        "meeting_count": len(all_meetings),
+        "departments_searched": list(departments_searched),
+        "csvs_processed": csvs_processed,
+        "by_official": dict(sorted(by_official.items(), key=lambda x: -x[1])),
+        "by_minister": dict(sorted(by_official.items(), key=lambda x: -x[1])),  # Alias
+        "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
+        "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
+        "note": "UK senior officials (Permanent Secretaries, DGs, SCS2+) meetings from GOV.UK transparency publications. Does not include lobbying expenditure."
+    }
+    
+    print(f"  Found {result['meetings_count']} senior officials meetings")
+    print(f"  Departments: {len(departments_searched)}")
+    if by_official:
+        print(f"  Top officials: {', '.join(list(by_official.keys())[:3])}")
     
     return result
 
@@ -839,6 +1346,7 @@ def search_austria_register(search_term: str) -> dict:
         "entries": matches,
         "entry_count": len(matches),
         "by_category": {},
+        "data_coverage": "2013-present",
         "note": "Austrian register (lobbyreg.justiz.gv.at). Financial data only shows if costs >€100,000."
     }
     
@@ -996,6 +1504,7 @@ def search_catalonia_register(search_term: str) -> dict:
         "by_category": by_category,
         "total_annual_volume": total_volume,
         "total_volume_formatted": f"€{total_volume:,}" if total_volume > 0 else "Not disclosed",
+        "data_coverage": "2016-present",
         "note": "Catalonia Interest Group Register (analisi.transparenciacatalunya.cat). Covers lobbying before Generalitat, Parliament, and local administrations."
     }
     
@@ -1137,6 +1646,7 @@ def search_finland_register(search_term: str) -> dict:
         "entries": entries,
         "entry_count": len(entries),
         "total_activities": total_activities,
+        "data_coverage": "2024-present (financial data from July 2026)",
         "note": "Finland Transparency Register (avoimuusrekisteri.fi). Financial data available from 2026."
     }
     
@@ -1352,13 +1862,14 @@ def search_slovenia_register(search_term: str) -> dict:
         "entry_count": len(entries),
         "top_fields": top_fields,
         "total_registered": len(lobbyists),
+        "data_coverage": "2010-present",
         "note": "Slovenia Register of Lobbyists (KPK). Lists individual lobbyists, not companies. Cross-reference with interest organization reports for company activities."
     }
     
     return result
 
 
-def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, output_path: str = None, org_name: str = None):
+def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, uk_officials_data: dict = None, output_path: str = None, org_name: str = None):
     """Create combined Excel report."""
     wb = Workbook()
     
@@ -1369,6 +1880,7 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
     header_fill_de = PatternFill("solid", fgColor="FFD700")  # Gold for Germany
     header_fill_ie = PatternFill("solid", fgColor="169B62")  # Green for Ireland
     header_fill_uk = PatternFill("solid", fgColor="012169")  # UK Blue
+    header_fill_uk_officials = PatternFill("solid", fgColor="4A4A8A")  # UK Officials Purple-ish
     header_fill_at = PatternFill("solid", fgColor="ED2939")  # Austria Red
     header_fill_cat = PatternFill("solid", fgColor="FCDD09")  # Catalonia Yellow (Senyera)
     header_fill_fi = PatternFill("solid", fgColor="003580")  # Finland Blue
@@ -1505,6 +2017,26 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
         ]
         
         for label, value in uk_stats:
+            ws.cell(row=row, column=1, value=label).font = Font(bold=True)
+            ws.cell(row=row, column=2, value=value)
+            row += 1
+        
+        row += 1
+    
+    # UK Senior Officials Summary
+    if uk_officials_data and uk_officials_data.get("meetings"):
+        ws.cell(row=row, column=1, value="UK (Senior Officials Meetings)").font = Font(bold=True, size=14, color="4A4A8A")
+        row += 1
+        
+        uk_so_stats = [
+            ("Search Term", uk_officials_data.get("search_term", org_name)),
+            ("Senior Officials Meetings", str(uk_officials_data.get("meetings_count", 0))),
+            ("Departments", str(len(uk_officials_data.get("departments_searched", [])))),
+            ("Officials Level", "Permanent Secretaries, DGs, SCS2+"),
+            ("Top Official", list(uk_officials_data.get("by_official", {}).keys())[0] if uk_officials_data.get("by_official") else "N/A"),
+        ]
+        
+        for label, value in uk_so_stats:
             ws.cell(row=row, column=1, value=label).font = Font(bold=True)
             ws.cell(row=row, column=2, value=value)
             row += 1
@@ -1908,6 +2440,54 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
             
             ws_uk_min.column_dimensions['A'].width = 40
             ws_uk_min.column_dimensions['B'].width = 15
+    
+    # === UK SENIOR OFFICIALS MEETINGS SHEET ===
+    if uk_officials_data and uk_officials_data.get("meetings"):
+        ws_uk_so = wb.create_sheet("UK Senior Officials")
+        
+        ws_uk_so['A1'] = f"UK Senior Officials Meetings - {org_name}"
+        ws_uk_so['A1'].font = Font(bold=True, size=14)
+        ws_uk_so.merge_cells('A1:E1')
+        
+        ws_uk_so['A2'] = "Source: GOV.UK Transparency | Officials: Permanent Secretaries, DGs, SCS2+"
+        ws_uk_so['A2'].font = Font(italic=True, size=10)
+        
+        cols = [
+            ("Date", 12), ("Official", 30), ("Organisation", 40),
+            ("Purpose", 50), ("Department", 30)
+        ]
+        for col_idx, (header, width) in enumerate(cols, 1):
+            cell = ws_uk_so.cell(row=4, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill_uk_officials
+            ws_uk_so.column_dimensions[get_column_letter(col_idx)].width = width
+        
+        for row_idx, meeting in enumerate(uk_officials_data["meetings"][:1000], 5):
+            ws_uk_so.cell(row=row_idx, column=1, value=meeting.get("date", ""))
+            ws_uk_so.cell(row=row_idx, column=2, value=meeting.get("minister", ""))  # Field is still called minister
+            ws_uk_so.cell(row=row_idx, column=3, value=meeting.get("organisation", ""))
+            ws_uk_so.cell(row=row_idx, column=4, value=meeting.get("purpose", ""))
+            ws_uk_so.cell(row=row_idx, column=5, value=meeting.get("department", ""))
+        
+        ws_uk_so.freeze_panes = 'A5'
+        
+        # Add by-official summary sheet
+        if uk_officials_data.get("by_official"):
+            ws_uk_off = wb.create_sheet("UK By Official")
+            ws_uk_off['A1'] = f"UK Meetings by Senior Official - {org_name}"
+            ws_uk_off['A1'].font = Font(bold=True, size=14)
+            
+            ws_uk_off.cell(row=3, column=1, value="Official").font = header_font
+            ws_uk_off.cell(row=3, column=2, value="Meetings").font = header_font
+            ws_uk_off.cell(row=3, column=1).fill = header_fill_uk_officials
+            ws_uk_off.cell(row=3, column=2).fill = header_fill_uk_officials
+            
+            for row_idx, (official, count) in enumerate(uk_officials_data["by_official"].items(), 4):
+                ws_uk_off.cell(row=row_idx, column=1, value=official)
+                ws_uk_off.cell(row=row_idx, column=2, value=count)
+            
+            ws_uk_off.column_dimensions['A'].width = 40
+            ws_uk_off.column_dimensions['B'].width = 15
     
     # === AUSTRIA REGISTER SHEET ===
     if at_data and at_data.get("entries"):

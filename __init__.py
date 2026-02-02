@@ -15,6 +15,7 @@ from eu_lobbying_core import (
     search_germany_register,
     fetch_germany_data,
     search_uk_ministerial_meetings,
+    search_uk_senior_officials_meetings,
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
@@ -70,6 +71,11 @@ def search_uk(search_term: str) -> dict:
     return search_uk_ministerial_meetings(search_term)
 
 
+def search_uk_officials(search_term: str) -> dict:
+    """Search UK senior officials meetings."""
+    return search_uk_senior_officials_meetings(search_term)
+
+
 def search_austria(search_term: str) -> dict:
     """Search Austria lobbying register."""
     return search_austria_register(search_term)
@@ -121,11 +127,20 @@ JURISDICTIONS = {
     },
     "uk": {
         "id": "uk",
-        "name": "United Kingdom",
+        "name": "UK Ministers",
         "flag": "🇬🇧", 
         "search_fn": search_uk,
         "has_financial_data": False,
-        "note": "Ministerial meetings only - no expenditure tracking. Can be slow.",
+        "note": "Ministerial meetings only - no expenditure tracking. Dynamically discovered from GOV.UK.",
+        "default_enabled": True,
+    },
+    "uk_officials": {
+        "id": "uk_officials",
+        "name": "UK Senior Officials",
+        "flag": "🇬🇧",
+        "search_fn": search_uk_officials,
+        "has_financial_data": False,
+        "note": "Permanent Secretaries, DGs, SCS2+ officials. Slower - can be disabled.",
         "default_enabled": False,
     },
     "austria": {

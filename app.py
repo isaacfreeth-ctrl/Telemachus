@@ -19,6 +19,7 @@ from eu_lobbying_core import (
     search_germany_register,
     fetch_germany_data,
     search_uk_ministerial_meetings,
+    search_uk_senior_officials_meetings,
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
@@ -48,10 +49,16 @@ JURISDICTIONS = {
         "default": True,
     },
     "uk": {
-        "name": "United Kingdom",
+        "name": "UK Ministers",
         "flag": "🇬🇧", 
-        "note": "Ministerial meetings only - takes 1-2 mins",
+        "note": "Ministerial meetings - dynamically discovered from GOV.UK",
         "default": True,
+    },
+    "uk_officials": {
+        "name": "UK Senior Officials",
+        "flag": "🇬🇧",
+        "note": "Permanent Secretaries, DGs, SCS2+ - slower search",
+        "default": False,
     },
     "austria": {
         "name": "Austria",
@@ -80,7 +87,7 @@ JURISDICTIONS = {
 }
 
 
-def run_search(search_term: str, selected: dict, skip_uk: bool, progress_callback=None):
+def run_search(search_term: str, selected: dict, progress_callback=None):
     """Run searches and return data in format expected by create_excel_report."""
     
     results = {
@@ -88,6 +95,7 @@ def run_search(search_term: str, selected: dict, skip_uk: bool, progress_callbac
         "france": None, 
         "germany": None,
         "uk": None,
+        "uk_officials": None,
         "austria": None,
         "catalonia": None,
         "finland": None,
@@ -130,13 +138,18 @@ def run_search(search_term: str, selected: dict, skip_uk: bool, progress_callbac
                 results["germany"] = fetch_germany_data(reg_num)
         done += 1
     
-    # UK
-    if selected.get("uk") and not skip_uk:
+    # UK Ministerial
+    if selected.get("uk"):
         if progress_callback:
             progress_callback("🇬🇧 Searching UK ministerial meetings...", done/total)
         results["uk"] = search_uk_ministerial_meetings(search_term)
         done += 1
-    elif selected.get("uk"):
+    
+    # UK Senior Officials
+    if selected.get("uk_officials"):
+        if progress_callback:
+            progress_callback("🇬🇧 Searching UK senior officials meetings...", done/total)
+        results["uk_officials"] = search_uk_senior_officials_meetings(search_term)
         done += 1
     
     # Austria
@@ -192,6 +205,7 @@ def generate_full_excel(search_term: str, results: dict) -> BytesIO:
             cat_data=results.get("catalonia"),
             fi_data=results.get("finland"),
             si_data=results.get("slovenia"),
+            uk_officials_data=results.get("uk_officials"),
             output_path=tmp_path,
             org_name=search_term
         )
@@ -246,7 +260,7 @@ def display_summary(search_term: str, results: dict):
             with cols[3]:
                 st.metric("Data Snapshots", len(regs))
             
-            st.caption(f"ID: {data.get('org_id', 'N/A')} | HQ: {latest.get('head_country', 'N/A')}")
+            st.caption(f"ID: {data.get('org_id', 'N/A')} | HQ: {latest.get('head_country', 'N/A')} | 📅 Data: {data.get('data_coverage', '2012-present')}")
     
     # France
     if results.get("france"):
@@ -267,7 +281,7 @@ def display_summary(search_term: str, results: dict):
             with cols[3]:
                 st.metric("Years of Data", len(exercises))
             
-            st.caption(f"SIREN: {info.get('identifiant_national', 'N/A')} | City: {info.get('ville', 'N/A')}")
+            st.caption(f"SIREN: {info.get('identifiant_national', 'N/A')} | City: {info.get('ville', 'N/A')} | 📅 Data: {data.get('data_coverage', '2017-present')}")
     
     # Germany
     if results.get("germany"):
@@ -288,12 +302,12 @@ def display_summary(search_term: str, results: dict):
             with cols[3]:
                 st.metric("Fields of Interest", len(data.get("fields_of_interest", [])))
             
-            st.caption(f"Reg: {data.get('register_number', 'N/A')} | Berlin Office: {'Yes' if data.get('berlin_office') else 'No'}")
+            st.caption(f"Reg: {data.get('register_number', 'N/A')} | Berlin Office: {'Yes' if data.get('berlin_office') else 'No'} | 📅 Data: {data.get('data_coverage', '2022-present')}")
     
-    # UK
+    # UK Ministerial
     if results.get("uk"):
         data = results["uk"]
-        with st.expander("🇬🇧 **United Kingdom** ✅", expanded=True):
+        with st.expander("🇬🇧 **UK Ministers** ✅", expanded=True):
             meetings = data.get("meetings", [])
             cols = st.columns(3)
             with cols[0]:
@@ -303,6 +317,21 @@ def display_summary(search_term: str, results: dict):
             with cols[2]:
                 by_minister = data.get("by_minister", {})
                 st.metric("Unique Ministers", len(by_minister))
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2022-present')}")
+    
+    # UK Senior Officials
+    if results.get("uk_officials"):
+        data = results["uk_officials"]
+        with st.expander("🇬🇧 **UK Senior Officials** ✅", expanded=True):
+            meetings = data.get("meetings", [])
+            cols = st.columns(3)
+            with cols[0]:
+                st.metric("Senior Official Meetings", len(meetings))
+            with cols[1]:
+                st.metric("Departments", len(data.get("departments_searched", [])))
+            with cols[2]:
+                by_official = data.get("by_official", {})
+                st.metric("Unique Officials", len(by_official))
     
     # Austria
     if results.get("austria"):
@@ -315,6 +344,7 @@ def display_summary(search_term: str, results: dict):
                 st.metric("Categories", len(data.get("by_category", {})))
             with cols[2]:
                 st.metric("Financial Data", "If >€100k")
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2013-present')}")
     
     # Catalonia
     if results.get("catalonia"):
@@ -327,6 +357,7 @@ def display_summary(search_term: str, results: dict):
                 st.metric("Annual Volume", data.get("total_volume_formatted", "N/A"))
             with cols[2]:
                 st.metric("Categories", len(data.get("by_category", {})))
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2016-present')}")
     
     # Finland
     if results.get("finland"):
@@ -339,6 +370,8 @@ def display_summary(search_term: str, results: dict):
                 st.metric("Activity Disclosures", data.get("total_activities", 0))
             with cols[2]:
                 st.metric("Financial Data", "From July 2026")
+            
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2024-present')}")
             
             # Show topics if available
             entries = data.get("entries", [])
@@ -366,7 +399,7 @@ def display_summary(search_term: str, results: dict):
                     company = f" ({e['company']})" if e.get('company') else ""
                     st.write(f"• {e['name']}{company}")
             
-            st.caption("⚠️ Slovenia lists individual lobbyists, not companies")
+            st.caption(f"⚠️ Slovenia lists individual lobbyists, not companies | 📅 Data: {data.get('data_coverage', '2010-present')}")
     
     # Not found
     for jur_id in not_found:
@@ -403,8 +436,7 @@ for jur_id, jur in JURISDICTIONS.items():
 st.sidebar.markdown(f"**{sum(selected.values())}** of {len(JURISDICTIONS)} selected")
 
 st.sidebar.header("⚙️ Options")
-st.sidebar.caption("UK search can take 1-2 minutes")
-include_uk = st.sidebar.checkbox("Include UK search", value=False, help="UK ministerial meetings search is slow but thorough")
+st.sidebar.caption("UK searches use GOV.UK dynamic discovery")
 
 # Main search
 col1, col2 = st.columns([3, 1])
@@ -428,7 +460,7 @@ if search_button and search_term:
             status_text.text(msg)
             progress_bar.progress(pct)
         
-        results = run_search(search_term, selected, not include_uk, update_progress)
+        results = run_search(search_term, selected, update_progress)
         
         time.sleep(0.3)
         status_text.empty()
