@@ -22,6 +22,7 @@ from eu_lobbying_core import (
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
+    search_slovenia_register,
     create_excel_report,
 )
 
@@ -70,6 +71,12 @@ JURISDICTIONS = {
         "note": "Financial data from July 2026",
         "default": True,
     },
+    "slovenia": {
+        "name": "Slovenia",
+        "flag": "🇸🇮",
+        "note": "Lists individual lobbyists - search by name/employer",
+        "default": True,
+    },
 }
 
 
@@ -84,6 +91,7 @@ def run_search(search_term: str, selected: dict, skip_uk: bool, progress_callbac
         "austria": None,
         "catalonia": None,
         "finland": None,
+        "slovenia": None,
     }
     
     total = sum(selected.values())
@@ -152,6 +160,13 @@ def run_search(search_term: str, selected: dict, skip_uk: bool, progress_callbac
         results["finland"] = search_finland_register(search_term)
         done += 1
     
+    # Slovenia
+    if selected.get("slovenia"):
+        if progress_callback:
+            progress_callback("🇸🇮 Searching Slovenia...", done/total)
+        results["slovenia"] = search_slovenia_register(search_term)
+        done += 1
+    
     if progress_callback:
         progress_callback("✅ Complete!", 1.0)
     
@@ -176,6 +191,7 @@ def generate_full_excel(search_term: str, results: dict) -> BytesIO:
             at_data=results.get("austria"),
             cat_data=results.get("catalonia"),
             fi_data=results.get("finland"),
+            si_data=results.get("slovenia"),
             output_path=tmp_path,
             org_name=search_term
         )
@@ -328,6 +344,29 @@ def display_summary(search_term: str, results: dict):
             entries = data.get("entries", [])
             if entries and entries[0].get("topics"):
                 st.write("**Topics:**", ", ".join(entries[0]["topics"][:5]))
+    
+    # Slovenia
+    if results.get("slovenia"):
+        data = results["slovenia"]
+        with st.expander("🇸🇮 **Slovenia** ✅", expanded=True):
+            cols = st.columns(3)
+            with cols[0]:
+                st.metric("Lobbyists Found", data.get("entry_count", 0))
+            with cols[1]:
+                st.metric("Total Registered", data.get("total_registered", 0))
+            with cols[2]:
+                top_fields = data.get("top_fields", [])
+                st.metric("Top Field", top_fields[0][0] if top_fields else "N/A")
+            
+            # Show matched lobbyists
+            entries = data.get("entries", [])
+            if entries:
+                st.write("**Matched Lobbyists:**")
+                for e in entries[:3]:
+                    company = f" ({e['company']})" if e.get('company') else ""
+                    st.write(f"• {e['name']}{company}")
+            
+            st.caption("⚠️ Slovenia lists individual lobbyists, not companies")
     
     # Not found
     for jur_id in not_found:

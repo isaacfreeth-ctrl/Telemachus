@@ -18,6 +18,7 @@ from eu_lobbying_core import (
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
+    search_slovenia_register,
 )
 
 
@@ -84,6 +85,11 @@ def search_finland(search_term: str) -> dict:
     return search_finland_register(search_term)
 
 
+def search_slovenia(search_term: str) -> dict:
+    """Search Slovenia lobbying register."""
+    return search_slovenia_register(search_term)
+
+
 # Registry of all jurisdictions
 JURISDICTIONS = {
     "eu": {
@@ -147,6 +153,15 @@ JURISDICTIONS = {
         "search_fn": search_finland,
         "has_financial_data": False,
         "note": "Financial data available from July 2026",
+        "default_enabled": True,
+    },
+    "slovenia": {
+        "id": "slovenia",
+        "name": "Slovenia",
+        "flag": "🇸🇮",
+        "search_fn": search_slovenia,
+        "has_financial_data": False,
+        "note": "Lists individual lobbyists, not companies. Search by lobbyist name or employer.",
         "default_enabled": True,
     },
 }

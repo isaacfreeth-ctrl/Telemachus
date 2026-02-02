@@ -1143,7 +1143,222 @@ def search_finland_register(search_term: str) -> dict:
     return result
 
 
-def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, output_path: str, org_name: str):
+# =============================================================================
+# SLOVENIA (KPK - Commission for the Prevention of Corruption)
+# =============================================================================
+
+SLOVENIA_REGISTER_URL = "https://www.kpk-rs.si/sl/lobiranje-22/register-lobistov"
+
+
+def get_slovenia_lobbyists() -> list:
+    """
+    Fetch all registered lobbyists from Slovenia's KPK register.
+    
+    The Slovenian register tracks individual lobbyists (natural persons), not companies.
+    Each lobbyist entry includes:
+    - Name
+    - Employer/company (if applicable)
+    - Fields of interest they lobby on
+    - Contact information
+    
+    Data source: https://www.kpk-rs.si/sl/lobiranje-22/register-lobistov
+    Administered by: Commission for the Prevention of Corruption (KPK)
+    """
+    from bs4 import BeautifulSoup
+    
+    cache_file = get_cache_dir() / "slovenia_lobbyists.html"
+    cache_max_age = 24 * 60 * 60  # 24 hours
+    
+    # Use cache if fresh
+    if cache_file.exists():
+        age = (datetime.now().timestamp() - cache_file.stat().st_mtime)
+        if age < cache_max_age:
+            html_content = cache_file.read_text(encoding='utf-8')
+        else:
+            html_content = None
+    else:
+        html_content = None
+    
+    # Fetch if no cache
+    if html_content is None:
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            }
+            response = requests.get(SLOVENIA_REGISTER_URL, headers=headers, timeout=30)
+            response.raise_for_status()
+            html_content = response.text
+            cache_file.write_text(html_content, encoding='utf-8')
+        except Exception as e:
+            print(f"  Error fetching Slovenia register: {e}")
+            return []
+    
+    # Parse HTML
+    soup = BeautifulSoup(html_content, 'html.parser')
+    lobbyists = []
+    
+    # Find all lobbyist entries - they're in divs with class 'flex flex-column gap-3'
+    # Structure: <strong>Name</strong> then <p> with fields, then <ul> with contact info
+    
+    # Find all strong tags that look like names (contain comma)
+    for strong in soup.find_all('strong'):
+        name = strong.get_text(strip=True)
+        
+        # Skip non-name entries
+        if ',' not in name:
+            continue
+        if any(skip in name.lower() for skip in ['lobist', 'register', 'sankcij', 'komisija']):
+            continue
+        
+        entry = {
+            'name': name,
+            'company': '',
+            'fields_of_interest': [],
+            'address': '',
+            'city': '',
+            'email': '',
+        }
+        
+        # Get parent div
+        parent = strong.find_parent('div', class_=lambda x: x and 'flex' in x)
+        if not parent:
+            parent = strong.parent
+        
+        if parent:
+            # Find fields of interest - in <p> tag with middots
+            fields_p = parent.find('p', class_='m-0')
+            if fields_p:
+                fields_text = fields_p.get_text()
+                # Split by middot (·) and clean
+                fields = [f.strip() for f in fields_text.split('·') if f.strip()]
+                entry['fields_of_interest'] = fields
+            
+            # Find contact info - in <ul> with <li> items
+            contact_ul = parent.find('ul')
+            if contact_ul:
+                for li in contact_ul.find_all('li'):
+                    li_text = li.get_text(strip=True)
+                    
+                    # Check for email
+                    if '@' in li_text:
+                        entry['email'] = li_text
+                    # Check for company (contains D.O.O., S.P., etc.)
+                    elif any(s in li_text.upper() for s in ['D.O.O.', 'D.O.O', 'S.P.', 'S.P', 'D. O. O.']):
+                        entry['company'] = li_text
+                    # Check for postal code (4 digits)
+                    elif re.search(r'^\d{4}\s', li_text):
+                        entry['city'] = li_text
+                    # Otherwise likely address
+                    elif re.search(r'\d', li_text) and not entry['address']:
+                        entry['address'] = li_text
+        
+        if entry['name']:
+            lobbyists.append(entry)
+    
+    # Remove duplicates by name
+    seen_names = set()
+    unique_lobbyists = []
+    for l in lobbyists:
+        if l['name'] not in seen_names:
+            seen_names.add(l['name'])
+            unique_lobbyists.append(l)
+    
+    return unique_lobbyists
+
+
+def search_slovenia_register(search_term: str) -> dict:
+    """
+    Search Slovenia's Lobbying Register (Register lobistov).
+    
+    IMPORTANT: Slovenia's register tracks INDIVIDUAL LOBBYISTS, not companies.
+    Search matches against:
+    - Lobbyist name
+    - Company/employer name
+    - Fields of interest
+    
+    To find corporate lobbying, search for:
+    - Known lobbyist names
+    - PR/PA firms (e.g., "Propiar", "Herman", "Bonorum")
+    - Industry terms in fields of interest
+    
+    Data source: https://www.kpk-rs.si/sl/lobiranje-22/register-lobistov
+    Administered by: Commission for the Prevention of Corruption (KPK)
+    
+    Note: This register shows WHO can lobby, not WHAT companies are lobbying.
+    To track corporate influence, you need to cross-reference:
+    - Lobbyist employer information
+    - Interest organization reports (submitted separately to KPK)
+    """
+    print(f"Searching Slovenia register for '{search_term}'...")
+    
+    lobbyists = get_slovenia_lobbyists()
+    
+    if not lobbyists:
+        print(f"  Could not fetch Slovenia lobbyist data")
+        return None
+    
+    search_lower = search_term.lower()
+    matches = []
+    
+    for lobbyist in lobbyists:
+        # Search in name
+        if search_lower in lobbyist.get('name', '').lower():
+            matches.append(lobbyist)
+            continue
+            
+        # Search in company
+        if search_lower in lobbyist.get('company', '').lower():
+            matches.append(lobbyist)
+            continue
+            
+        # Search in fields of interest
+        for field in lobbyist.get('fields_of_interest', []):
+            if search_lower in field.lower():
+                matches.append(lobbyist)
+                break
+    
+    if not matches:
+        print(f"  No matches found for '{search_term}' in Slovenia register")
+        return None
+    
+    print(f"  Found {len(matches)} matching lobbyist(s)")
+    
+    # Organize results
+    entries = []
+    fields_summary = {}
+    
+    for m in matches:
+        entries.append({
+            'name': m.get('name', ''),
+            'company': m.get('company', ''),
+            'fields_of_interest': m.get('fields_of_interest', []),
+            'address': m.get('address', ''),
+            'city': m.get('city', ''),
+            'email': m.get('email', ''),
+        })
+        
+        # Count field occurrences
+        for field in m.get('fields_of_interest', []):
+            fields_summary[field] = fields_summary.get(field, 0) + 1
+    
+    # Sort fields by frequency
+    top_fields = sorted(fields_summary.items(), key=lambda x: -x[1])[:10]
+    
+    result = {
+        "search_term": search_term,
+        "entries": entries,
+        "entry_count": len(entries),
+        "top_fields": top_fields,
+        "total_registered": len(lobbyists),
+        "note": "Slovenia Register of Lobbyists (KPK). Lists individual lobbyists, not companies. Cross-reference with interest organization reports for company activities."
+    }
+    
+    return result
+
+
+def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, output_path: str = None, org_name: str = None):
     """Create combined Excel report."""
     wb = Workbook()
     
@@ -1157,6 +1372,7 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
     header_fill_at = PatternFill("solid", fgColor="ED2939")  # Austria Red
     header_fill_cat = PatternFill("solid", fgColor="FCDD09")  # Catalonia Yellow (Senyera)
     header_fill_fi = PatternFill("solid", fgColor="003580")  # Finland Blue
+    header_fill_si = PatternFill("solid", fgColor="005DA4")  # Slovenia Blue
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     cell_align = Alignment(vertical="top", wrap_text=True)
     border = Border(
@@ -1357,6 +1573,28 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
         ]
         
         for label, value in fi_stats:
+            ws.cell(row=row, column=1, value=label).font = Font(bold=True)
+            ws.cell(row=row, column=2, value=value)
+            row += 1
+    
+    # Slovenia Summary
+    if si_data and si_data.get("entries"):
+        row += 1
+        ws.cell(row=row, column=1, value="SLOVENIA (Register lobistov)").font = Font(bold=True, size=14, color="005DA4")
+        row += 1
+        
+        # Get top fields summary
+        top_fields_str = ", ".join([f[0] for f in si_data.get("top_fields", [])[:5]]) or "N/A"
+        
+        si_stats = [
+            ("Search Term", si_data.get("search_term", org_name)),
+            ("Lobbyists Found", str(si_data.get("entry_count", 0))),
+            ("Total Registered Lobbyists", str(si_data.get("total_registered", 0))),
+            ("Top Fields of Interest", top_fields_str),
+            ("Note", "Lists individual lobbyists, not companies"),
+        ]
+        
+        for label, value in si_stats:
             ws.cell(row=row, column=1, value=label).font = Font(bold=True)
             ws.cell(row=row, column=2, value=value)
             row += 1
@@ -1769,6 +2007,38 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
             ws_fi.cell(row=row_idx, column=7, value=topics_str)
         
         ws_fi.freeze_panes = 'A5'
+    
+    # === SLOVENIA REGISTER SHEET ===
+    if si_data and si_data.get("entries"):
+        ws_si = wb.create_sheet("Slovenia Lobbyists")
+        
+        ws_si['A1'] = f"Slovenia Register of Lobbyists - {org_name}"
+        ws_si['A1'].font = Font(bold=True, size=14)
+        ws_si.merge_cells('A1:F1')
+        
+        ws_si['A2'] = "Source: kpk-rs.si | Lists individual lobbyists, not companies"
+        ws_si['A2'].font = Font(italic=True, size=10)
+        
+        cols = [
+            ("Lobbyist Name", 30), ("Company/Employer", 35), ("Fields of Interest", 60),
+            ("Address", 30), ("City", 20), ("Email", 30)
+        ]
+        for col_idx, (header, width) in enumerate(cols, 1):
+            cell = ws_si.cell(row=4, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill_si
+            ws_si.column_dimensions[get_column_letter(col_idx)].width = width
+        
+        for row_idx, entry in enumerate(si_data["entries"][:500], 5):
+            ws_si.cell(row=row_idx, column=1, value=entry.get("name", ""))
+            ws_si.cell(row=row_idx, column=2, value=entry.get("company", ""))
+            fields_str = " · ".join(entry.get("fields_of_interest", []))[:300]
+            ws_si.cell(row=row_idx, column=3, value=fields_str)
+            ws_si.cell(row=row_idx, column=4, value=entry.get("address", ""))
+            ws_si.cell(row=row_idx, column=5, value=entry.get("city", ""))
+            ws_si.cell(row=row_idx, column=6, value=entry.get("email", ""))
+        
+        ws_si.freeze_panes = 'A5'
     
     wb.save(output_path)
     print(f"\nReport saved to: {output_path}")
