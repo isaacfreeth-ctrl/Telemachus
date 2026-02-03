@@ -19,6 +19,8 @@ from eu_lobbying_core import (
     search_germany_register,
     fetch_germany_data,
     search_uk_ministerial_meetings,
+    search_uk_senior_officials_meetings,
+    search_uk_index,
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
@@ -48,10 +50,16 @@ JURISDICTIONS = {
         "default": True,
     },
     "uk": {
-        "name": "UK Ministers & Senior Officials",
+        "name": "UK Ministers",
         "flag": "🇬🇧", 
-        "note": "Ministerial + senior officials meetings from GOV.UK (2022+)",
+        "note": "13,000+ meetings 2024-2026 (instant search)",
         "default": True,
+    },
+    "uk_officials": {
+        "name": "UK Senior Officials (Live)",
+        "flag": "🇬🇧",
+        "note": "Live search - slower but most recent data",
+        "default": False,
     },
     "austria": {
         "name": "Austria",
@@ -88,6 +96,7 @@ def run_search(search_term: str, selected: dict, progress_callback=None):
         "france": None, 
         "germany": None,
         "uk": None,
+        "uk_officials": None,
         "austria": None,
         "catalonia": None,
         "finland": None,
@@ -130,11 +139,22 @@ def run_search(search_term: str, selected: dict, progress_callback=None):
                 results["germany"] = fetch_germany_data(reg_num)
         done += 1
     
-    # UK Ministerial
+    # UK - Try fast index first, fall back to live search
     if selected.get("uk"):
         if progress_callback:
-            progress_callback("🇬🇧 Searching UK ministerial meetings...", done/total)
-        results["uk"] = search_uk_ministerial_meetings(search_term)
+            progress_callback("🇬🇧 Searching UK meetings...", done/total)
+        # Try fast pre-built index first
+        results["uk"] = search_uk_index(search_term)
+        if results["uk"] is None:
+            # Fall back to live search (slower)
+            results["uk"] = search_uk_ministerial_meetings(search_term)
+        done += 1
+    
+    # UK Senior Officials
+    if selected.get("uk_officials"):
+        if progress_callback:
+            progress_callback("🇬🇧 Searching UK senior officials...", done/total)
+        results["uk_officials"] = search_uk_senior_officials_meetings(search_term)
         done += 1
     
     # Austria
@@ -190,7 +210,7 @@ def generate_full_excel(search_term: str, results: dict) -> BytesIO:
             cat_data=results.get("catalonia"),
             fi_data=results.get("finland"),
             si_data=results.get("slovenia"),
-            uk_officials_data=None,  # Senior officials now included in uk_data
+            uk_officials_data=results.get("uk_officials"),
             output_path=tmp_path,
             org_name=search_term
         )
@@ -302,7 +322,21 @@ def display_summary(search_term: str, results: dict):
             with cols[2]:
                 by_minister = data.get("by_minister", {})
                 st.metric("Unique Ministers", len(by_minister))
-            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2022-present')}")
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2024-present')}")
+    
+    # UK Senior Officials
+    if results.get("uk_officials"):
+        data = results["uk_officials"]
+        with st.expander("🇬🇧 **UK Senior Officials** ✅", expanded=True):
+            meetings = data.get("meetings", [])
+            cols = st.columns(3)
+            with cols[0]:
+                st.metric("Meetings", len(meetings))
+            with cols[1]:
+                st.metric("Departments", len(data.get("by_department", {})))
+            with cols[2]:
+                st.metric("Unique Officials", len(data.get("by_official", {})))
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', 'Last year')}")
     
     # Austria
     if results.get("austria"):

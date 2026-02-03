@@ -783,23 +783,145 @@ def get_senior_officials_csv_urls_from_publication(publication_path: str) -> lis
     return csv_urls
 
 
-def search_uk_ministerial_meetings(search_term: str, max_publications: int = 500, include_senior_officials: bool = True) -> dict:
+# ============================================================================
+# UK MEETINGS - FAST INDEX-BASED SEARCH
+# ============================================================================
+
+_uk_index_cache = {"data": None, "loaded": False}
+UK_INDEX_URL = "https://raw.githubusercontent.com/your-username/telemachus/main/uk_meetings_index.json"
+
+
+def load_uk_index():
+    """Load the pre-built UK meetings index."""
+    
+    if _uk_index_cache["loaded"]:
+        return _uk_index_cache["data"]
+    
+    # Try local file first
+    local_path = Path(__file__).parent / "uk_meetings_index.json"
+    
+    if local_path.exists():
+        try:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                _uk_index_cache["data"] = json.load(f)
+                _uk_index_cache["loaded"] = True
+                print(f"  Loaded UK index from local file ({len(_uk_index_cache['data']['meetings'])} meetings)")
+                return _uk_index_cache["data"]
+        except Exception as e:
+            print(f"  Error loading local index: {e}")
+    
+    # Try remote URL
+    try:
+        response = requests.get(UK_INDEX_URL, timeout=30)
+        response.raise_for_status()
+        _uk_index_cache["data"] = response.json()
+        _uk_index_cache["loaded"] = True
+        print(f"  Loaded UK index from remote ({len(_uk_index_cache['data']['meetings'])} meetings)")
+        return _uk_index_cache["data"]
+    except Exception as e:
+        print(f"  Could not load UK index: {e}")
+        return None
+
+
+def search_uk_index(search_term: str) -> dict:
+    """
+    Fast search of pre-built UK meetings index.
+    
+    This is instant because it searches a local JSON file instead of
+    making hundreds of API calls.
+    """
+    print(f"Searching UK meetings index for '{search_term}'...")
+    
+    index = load_uk_index()
+    
+    if not index:
+        print("  No index available, falling back to live search")
+        return None
+    
+    search_lower = search_term.lower()
+    meetings = index["meetings"]
+    
+    # Find matching meetings
+    matches = []
+    for m in meetings:
+        org = m.get("organisation", "").lower()
+        if search_lower in org:
+            matches.append(m)
+    
+    if not matches:
+        print(f"  No meetings found for '{search_term}'")
+        return None
+    
+    # Aggregate stats
+    by_minister = {}
+    by_department = {}
+    by_year = {}
+    
+    for m in matches:
+        minister = m.get("minister", "Unknown")
+        dept = m.get("department", "Unknown")
+        date = m.get("date", "")
+        
+        by_minister[minister] = by_minister.get(minister, 0) + 1
+        by_department[dept] = by_department.get(dept, 0) + 1
+        
+        # Extract year
+        year = ""
+        if "/" in date:
+            parts = date.split("/")
+            year = parts[2] if len(parts) > 2 and len(parts[2]) == 4 else parts[0] if len(parts[0]) == 4 else ""
+        elif "-" in date:
+            year = date[:4]
+        if year:
+            by_year[year] = by_year.get(year, 0) + 1
+    
+    result = {
+        "search_term": search_term,
+        "meetings": matches,
+        "meetings_count": len(matches),
+        "meeting_count": len(matches),
+        "by_minister": dict(sorted(by_minister.items(), key=lambda x: -x[1])),
+        "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
+        "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
+        "data_coverage": index["metadata"].get("coverage", "2012-present"),
+        "index_date": index["metadata"].get("created", "Unknown"),
+        "note": "UK ministerial and senior officials meetings from pre-built index. Fast search."
+    }
+    
+    print(f"  Found {len(matches)} meetings")
+    
+    return result
+
+
+def search_uk_ministerial_meetings(search_term: str, use_index: bool = True) -> dict:
     """
     Search UK ministerial meetings for an organisation.
     
-    This function dynamically discovers all ministerial meetings transparency
-    publications from GOV.UK, then searches their CSV attachments.
-    
-    Data source: GOV.UK ministerial transparency publications
-    Published quarterly by each government department.
-    Coverage: All UK government departments from 2010 onwards.
+    By default, uses a pre-built index for instant results (~25ms).
+    The index contains ~13,000 meetings from the last 2 years.
     
     Args:
         search_term: Company or organisation name to search for
-        max_publications: Maximum number of ministerial publications to process (default 500)
-        include_senior_officials: Also search senior officials meetings (default True)
+        use_index: If True (default), use fast pre-built index. If False, search live.
+    """
     
-    The discovery is cached for 24 hours to avoid repeated API calls.
+    # Use index for fast search
+    if use_index:
+        result = search_uk_index(search_term)
+        if result:
+            return result
+        print("  Index not available, falling back to live search...")
+    
+    # Fall back to live search (slow)
+    return _search_uk_ministerial_meetings_live(search_term)
+
+
+def _search_uk_ministerial_meetings_live(search_term: str, months_back: int = 6) -> dict:
+    """
+    Live search of UK ministerial meetings (slower, ~40-80 seconds).
+    
+    This function dynamically discovers all ministerial meetings transparency
+    publications from GOV.UK, then searches their CSV attachments.
     """
     print(f"Searching UK ministerial meetings for '{search_term}'...")
     
@@ -808,17 +930,27 @@ def search_uk_ministerial_meetings(search_term: str, max_publications: int = 500
     csvs_processed = 0
     search_lower = search_term.lower()
     
+    # Calculate cutoff date
+    from datetime import datetime, timedelta
+    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    
     # Step 1: Discover all ministerial transparency publications
     publications = discover_uk_transparency_publications()
     
-    # Sort by date (most recent first) and limit
+    # Filter by date (only publications from last N months)
+    publications_filtered = [
+        p for p in publications 
+        if p.get("date", "0000-00-00") >= cutoff_date
+    ]
+    
+    # Sort by date (most recent first)
     publications_sorted = sorted(
-        publications, 
+        publications_filtered, 
         key=lambda x: x.get("date", ""), 
         reverse=True
-    )[:max_publications]
+    )
     
-    print(f"  Processing {len(publications_sorted)} ministerial publications...")
+    print(f"  Processing {len(publications_sorted)} publications from last {months_back} months...")
     
     # Step 2: For each publication, get CSV URLs and search them
     # We'll cache the CSV URL discovery per publication
@@ -1024,7 +1156,7 @@ def search_uk_ministerial_meetings(search_term: str, max_publications: int = 500
         "by_minister": dict(sorted(by_minister.items(), key=lambda x: -x[1])),
         "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
         "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
-        "data_coverage": "2022-present (ministerial) + last year (senior officials)",
+        "data_coverage": f"Last {months_back} months",
         "date_range": date_range,
         "note": "UK ministerial and senior officials meetings from GOV.UK transparency publications (dynamically discovered). Does not include lobbying expenditure."
     }
@@ -1042,7 +1174,7 @@ def search_uk_ministerial_meetings(search_term: str, max_publications: int = 500
     return result
 
 
-def search_uk_senior_officials_meetings(search_term: str, max_publications: int = 300) -> dict:
+def search_uk_senior_officials_meetings(search_term: str, months_back: int = 6) -> dict:
     """
     Search UK senior officials meetings for an organisation.
     
@@ -1054,11 +1186,10 @@ def search_uk_senior_officials_meetings(search_term: str, max_publications: int 
     
     Data source: GOV.UK senior officials transparency publications
     Published quarterly by each government department.
-    Coverage: All UK government departments.
     
     Args:
         search_term: Company or organisation name to search for
-        max_publications: Maximum number of publications to process (default 300)
+        months_back: How many months of data to search (default 6)
     
     The discovery is cached for 24 hours to avoid repeated API calls.
     """
@@ -1069,16 +1200,26 @@ def search_uk_senior_officials_meetings(search_term: str, max_publications: int 
     csvs_processed = 0
     search_lower = search_term.lower()
     
+    # Calculate cutoff date
+    from datetime import datetime, timedelta
+    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    
     # Step 1: Discover senior officials publications
-    publications = discover_uk_senior_officials_publications(max_results=max_publications)
+    publications = discover_uk_senior_officials_publications()
+    
+    # Filter by date
+    publications_filtered = [
+        p for p in publications
+        if p.get("date", "0000-00-00") >= cutoff_date
+    ]
     
     publications_sorted = sorted(
-        publications,
+        publications_filtered,
         key=lambda x: x.get("date", ""),
         reverse=True
-    )[:max_publications]
+    )
     
-    print(f"  Processing {len(publications_sorted)} senior officials publications...")
+    print(f"  Processing {len(publications_sorted)} publications from last {months_back} months...")
     
     # Step 2: Get CSV URLs with caching
     csv_urls_cache_file = UK_MEETINGS_CACHE_DIR / "senior_officials_csv_urls_cache.json"
@@ -1207,6 +1348,7 @@ def search_uk_senior_officials_meetings(search_term: str, max_publications: int 
         "by_minister": dict(sorted(by_official.items(), key=lambda x: -x[1])),  # Alias
         "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
         "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
+        "data_coverage": f"Last {months_back} months",
         "note": "UK senior officials (Permanent Secretaries, DGs, SCS2+) meetings from GOV.UK transparency publications. Does not include lobbying expenditure."
     }
     
