@@ -20,7 +20,6 @@ from eu_lobbying_core import (
     fetch_germany_data,
     search_uk_ministerial_meetings,
     search_uk_senior_officials_meetings,
-    search_uk_index,
     search_austria_register,
     search_catalonia_register,
     search_finland_register,
@@ -144,7 +143,7 @@ def run_search(search_term: str, selected: dict, progress_callback=None):
         if progress_callback:
             progress_callback("🇬🇧 Searching UK meetings...", done/total)
         # Try fast pre-built index first
-        results["uk"] = search_uk_index(search_term)
+        results["uk"] = search_uk_ministerial_meetings(search_term)
         if results["uk"] is None:
             # Fall back to live search (slower)
             results["uk"] = search_uk_ministerial_meetings(search_term)
