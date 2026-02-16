@@ -1481,7 +1481,7 @@ def load_uk_index():
         return None
 
 
-def search_uk_index(search_term: str, months_back: int = None) -> dict:
+def search_uk_index(search_term: str, months_back: int = None, search_field: str = "organisation") -> dict:
     """
     Fast search of pre-built UK meetings index.
     
@@ -1492,14 +1492,14 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
         search_term: Company or organisation name to search for.
                      Supports Boolean operators: AND, OR, NOT, quotes, parentheses.
         months_back: If set, filter to meetings within last N months. None = all.
+        search_field: "organisation" (default) or "minister" to search by official name.
     
     Examples:
         search_uk_index("palantir")
-        search_uk_index("palantir OR anduril")
-        search_uk_index("meta NOT facebook")
-        search_uk_index("(shell OR bp) AND energy")
+        search_uk_index("Gareth Davies", search_field="minister")
     """
-    print(f"Searching UK meetings index for '{search_term}'...")
+    field_label = "minister/official" if search_field == "minister" else "organisation"
+    print(f"Searching UK meetings index for '{search_term}' (by {field_label})...")
     
     index = load_uk_index()
     
@@ -1521,14 +1521,14 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
     # Find matching meetings
     matches = []
     for m in meetings:
-        org = m.get("organisation", "")
+        field_value = m.get(search_field, "") or m.get("minister", "") if search_field == "minister" else m.get("organisation", "")
         
-        # Check if organisation matches query
+        # Check if field matches query
         if use_boolean:
-            if not boolean_match(search_term, org):
+            if not boolean_match(search_term, field_value):
                 continue
         else:
-            if search_lower not in org.lower():
+            if search_lower not in field_value.lower():
                 continue
             
         # Apply date filter if set
@@ -1541,19 +1541,19 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
                 parts = date_str.split("/")
                 if len(parts) == 3:
                     try:
-                        # DD/MM/YYYY
+                        # DD/MM/YYYY (standard after normalization)
                         if len(parts[2]) == 4:
                             meeting_date = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
-                        # YYYY/MM/DD
+                        # YYYY/MM/DD (legacy, shouldn't appear in new index)
                         elif len(parts[0]) == 4:
                             meeting_date = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
-                    except:
+                    except (ValueError, IndexError):
                         pass
             elif "-" in date_str and len(date_str) >= 10:
                 try:
-                    # YYYY-MM-DD
+                    # YYYY-MM-DD (legacy, shouldn't appear in new index)
                     meeting_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
-                except:
+                except (ValueError, IndexError):
                     pass
             
             # Skip if date couldn't be parsed or is before cutoff
@@ -1570,14 +1570,17 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
     by_minister = {}
     by_department = {}
     by_year = {}
+    by_organisation = {}
     
     for m in matches:
         minister = m.get("minister", "Unknown")
         dept = m.get("department", "Unknown")
+        org = m.get("organisation", "Unknown")
         date = m.get("date", "")
         
         by_minister[minister] = by_minister.get(minister, 0) + 1
         by_department[dept] = by_department.get(dept, 0) + 1
+        by_organisation[org] = by_organisation.get(org, 0) + 1
         
         # Extract year
         year = ""
@@ -1597,12 +1600,14 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
     
     result = {
         "search_term": search_term,
+        "search_field": search_field,
         "meetings": matches,
         "meetings_count": len(matches),
         "meeting_count": len(matches),
         "departments_searched": list(by_department.keys()),
         "by_minister": dict(sorted(by_minister.items(), key=lambda x: -x[1])),
         "by_department": dict(sorted(by_department.items(), key=lambda x: -x[1])),
+        "by_organisation": dict(sorted(by_organisation.items(), key=lambda x: -x[1])),
         "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
         "data_coverage": coverage,
         "index_date": index["metadata"].get("created", "Unknown"),
@@ -1614,27 +1619,28 @@ def search_uk_index(search_term: str, months_back: int = None) -> dict:
     return result
 
 
-def search_uk_ministerial_meetings(search_term: str, use_index: bool = True, months_back: int = None) -> dict:
+def search_uk_ministerial_meetings(search_term: str, use_index: bool = True, months_back: int = None, search_field: str = "organisation") -> dict:
     """
-    Search UK ministerial meetings for an organisation.
+    Search UK ministerial meetings for an organisation or minister.
     
     By default, uses a pre-built index for instant results (~25ms).
-    The index contains ~26,000 meetings (ministers + senior officials).
+    The index contains ~89,000 meetings (ministers + senior officials).
     
     Args:
-        search_term: Company or organisation name to search for
+        search_term: Company/organisation name or minister name to search for
         use_index: If True (default), use fast pre-built index. If False, search live.
         months_back: If set, filter results to last N months. None = all available.
+        search_field: "organisation" (default) or "minister" to search by official name.
     """
     
     # Use index for fast search
     if use_index:
-        result = search_uk_index(search_term, months_back=months_back)
+        result = search_uk_index(search_term, months_back=months_back, search_field=search_field)
         if result:
             return result
         print("  Index not available, falling back to live search...")
     
-    # Fall back to live search (slow)
+    # Fall back to live search (slow, only supports org search)
     return _search_uk_ministerial_meetings_live(search_term)
 
 
@@ -4410,6 +4416,28 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
             
             ws_uk_min.column_dimensions['A'].width = 40
             ws_uk_min.column_dimensions['B'].width = 15
+        
+        # Add UK by-organisation summary sheet (especially useful for minister search)
+        if uk_data.get("by_organisation"):
+            ws_uk_org = wb.create_sheet("UK By Organisation")
+            search_field = uk_data.get("search_field", "organisation")
+            if search_field == "minister":
+                ws_uk_org['A1'] = f"Organisations met by {org_name}"
+            else:
+                ws_uk_org['A1'] = f"UK Meetings by Organisation - {org_name}"
+            ws_uk_org['A1'].font = Font(bold=True, size=14)
+            
+            ws_uk_org.cell(row=3, column=1, value="Organisation").font = header_font
+            ws_uk_org.cell(row=3, column=2, value="Meetings").font = header_font
+            ws_uk_org.cell(row=3, column=1).fill = header_fill_uk
+            ws_uk_org.cell(row=3, column=2).fill = header_fill_uk
+            
+            for row_idx, (org, count) in enumerate(uk_data["by_organisation"].items(), 4):
+                ws_uk_org.cell(row=row_idx, column=1, value=org)
+                ws_uk_org.cell(row=row_idx, column=2, value=count)
+            
+            ws_uk_org.column_dimensions['A'].width = 60
+            ws_uk_org.column_dimensions['B'].width = 15
     
     # === UK SENIOR OFFICIALS MEETINGS SHEET ===
     if uk_officials_data and uk_officials_data.get("meetings"):

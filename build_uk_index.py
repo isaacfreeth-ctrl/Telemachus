@@ -162,6 +162,120 @@ def get_csv_urls_from_publication(pub_link):
     return [(url, publication_url) for url in csv_urls], None
 
 
+def normalize_date(date_str: str, fallback_year: str = "") -> str:
+    """
+    Normalize any date string to DD/MM/YYYY format.
+    
+    Handles:
+        DD/MM/YYYY  -> DD/MM/YYYY (pass through)
+        YYYY-MM-DD  -> DD/MM/YYYY
+        YYYY/MM/DD  -> DD/MM/YYYY
+        DD.MM.YY    -> DD/MM/20YY
+        DD.MM.YYYY  -> DD/MM/YYYY
+        YYYY.MM.DD  -> DD/MM/YYYY
+        D.M.YY      -> DD/MM/20YY  (single digit day/month)
+        YYYY-MM     -> 01/MM/YYYY
+        "June"      -> June (leave month-only text as-is but try to parse)
+        "April 2011"-> 01/04/2011
+        "November, 2010" -> 01/11/2010
+        "May, 2010"  -> 01/05/2010
+        "Nov-16"     -> 01/11/2016 (Mon-YY format)
+        "Mar-17"     -> 01/03/2017
+        "Oct-10"     -> 01/10/2010
+    """
+    if not date_str:
+        return ""
+    
+    date_str = date_str.strip()
+    
+    MONTHS = {
+        'january': '01', 'february': '02', 'march': '03', 'april': '04',
+        'may': '05', 'june': '06', 'july': '07', 'august': '08',
+        'september': '09', 'october': '10', 'november': '11', 'december': '12',
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+        'jun': '06', 'jul': '07', 'aug': '08', 'sep': '09',
+        'oct': '10', 'nov': '11', 'dec': '12'
+    }
+    
+    # Already in DD/MM/YYYY?
+    if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', date_str):
+        parts = date_str.split('/')
+        return f"{int(parts[0]):02d}/{int(parts[1]):02d}/{parts[2]}"
+    
+    # YYYY-MM-DD
+    m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', date_str)
+    if m:
+        return f"{int(m.group(3)):02d}/{int(m.group(2)):02d}/{m.group(1)}"
+    
+    # YYYY/MM/DD
+    m = re.match(r'^(\d{4})/(\d{1,2})/(\d{1,2})$', date_str)
+    if m:
+        return f"{int(m.group(3)):02d}/{int(m.group(2)):02d}/{m.group(1)}"
+    
+    # Dot-separated: could be DD.MM.YY, DD.MM.YYYY, YYYY.MM.DD, or D.M.YY
+    m = re.match(r'^(\d{1,4})[.](\d{1,2})[.](\d{1,4})$', date_str)
+    if m:
+        a, b, c = m.group(1), m.group(2), m.group(3)
+        if len(a) == 4:
+            # YYYY.MM.DD
+            return f"{int(c):02d}/{int(b):02d}/{a}"
+        elif len(c) == 4:
+            # DD.MM.YYYY
+            return f"{int(a):02d}/{int(b):02d}/{c}"
+        elif len(c) == 2:
+            # DD.MM.YY -> DD/MM/20YY (or 19YY if > 50)
+            year = int(c)
+            full_year = 2000 + year if year < 50 else 1900 + year
+            return f"{int(a):02d}/{int(b):02d}/{full_year}"
+    
+    # YYYY-MM (month only)
+    m = re.match(r'^(\d{4})-(\d{1,2})$', date_str)
+    if m:
+        return f"01/{int(m.group(2)):02d}/{m.group(1)}"
+    
+    # Mon-YY format: "Nov-16", "Mar-17", "Oct-10"
+    m = re.match(r'^(\w{3,})-(\d{2})$', date_str)
+    if m:
+        month_name = m.group(1).lower()
+        yy = int(m.group(2))
+        if month_name in MONTHS:
+            full_year = 2000 + yy if yy < 50 else 1900 + yy
+            return f"01/{MONTHS[month_name]}/{full_year}"
+    
+    # Text month with year: "April 2011", "November, 2010", "May, 2010"
+    m = re.match(r'^(\w+),?\s+(\d{4})$', date_str)
+    if m:
+        month_name = m.group(1).lower()
+        year = m.group(2)
+        if month_name in MONTHS:
+            return f"01/{MONTHS[month_name]}/{year}"
+    
+    # Month name only: "June", "October" - use fallback year if available
+    month_lower = date_str.lower().strip().rstrip(',')
+    if month_lower in MONTHS:
+        if fallback_year:
+            return f"01/{MONTHS[month_lower]}/{fallback_year}"
+        return date_str  # Can't normalize without year
+    
+    # Fallback: return as-is
+    return date_str
+
+
+def normalize_column_key(key: str) -> str:
+    """
+    Normalize a CSV column header for matching.
+    Strips BOM, lowercases, strips whitespace, and normalizes apostrophe variants.
+    """
+    if not key:
+        return ""
+    # Strip BOM character (U+FEFF) that appears in some CSV first columns
+    key = key.replace('\ufeff', '')
+    # Normalize smart/curly apostrophes to regular
+    key = key.replace('\u2018', "'").replace('\u2019', "'")
+    key = key.replace('\u201c', '"').replace('\u201d', '"')
+    return key.lower().strip()
+
+
 def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial", source_url=""):
     """
     Download a CSV file and parse meeting records from it.
@@ -172,6 +286,15 @@ def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial"
     Returns: (meetings_list, error_string_or_None)
     """
     meetings = []
+    
+    # Extract a fallback year from source URL for month-only dates
+    # e.g. "october-to-december-2013" -> 2013
+    fallback_year = ""
+    if source_url:
+        year_match = re.findall(r'(\d{4})', source_url)
+        if year_match:
+            # Take the last year found (usually the most relevant)
+            fallback_year = year_match[-1]
     
     try:
         r = requests.get(url, timeout=60)
@@ -188,27 +311,39 @@ def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial"
         reader = csv.DictReader(io.StringIO(content))
         
         for row in reader:
-            # Normalize column names to lowercase
-            row_lower = {k.lower().strip(): v.strip() if v else '' for k, v in row.items() if k}
+            # Normalize column names: lowercase, strip, and fix apostrophe variants
+            row_lower = {normalize_column_key(k): v.strip() if v else '' for k, v in row.items() if k}
             
             # Extract minister/official name (various column names across departments)
             minister = (
                 row_lower.get("minister", "") or
                 row_lower.get("minister's name", "") or
-                row_lower.get("name", "") or
-                row_lower.get("official", "") or
-                row_lower.get("senior official", "") or
+                row_lower.get("minister name", "") or
+                row_lower.get("senior official's name", "") or
+                row_lower.get("senior official name", "") or
                 row_lower.get("name of senior official", "") or
+                row_lower.get("senior official", "") or
+                row_lower.get("official", "") or
+                row_lower.get("official's name", "") or
+                row_lower.get("official name", "") or
+                row_lower.get("permanent secretary", "") or
+                row_lower.get("director general", "") or
+                row_lower.get("director general's name", "") or
+                row_lower.get("name", "") or
                 ""
             ).strip()
             
             # Extract date
-            date = (
+            date_raw = (
                 row_lower.get("date", "") or
                 row_lower.get("date of meeting", "") or
                 row_lower.get("meeting date", "") or
+                row_lower.get("date of external meeting", "") or
                 ""
             ).strip()
+            
+            # Normalize date to DD/MM/YYYY
+            date = normalize_date(date_raw, fallback_year=fallback_year)
             
             # Extract organisation
             # Column names vary across departments and years:
@@ -219,6 +354,7 @@ def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial"
             org = (
                 row_lower.get("name of individual or organisation", "") or
                 row_lower.get("name of organisation or individual", "") or
+                row_lower.get("person or organisation that meeting was with", "") or
                 row_lower.get("organisation", "") or
                 row_lower.get("organizations", "") or
                 row_lower.get("organisations", "") or
@@ -226,6 +362,7 @@ def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial"
                 row_lower.get("name of external organisation", "") or
                 row_lower.get("external organisation", "") or
                 row_lower.get("organisation(s)", "") or
+                row_lower.get("name of external organisation(s)", "") or
                 ""
             ).strip()
             
@@ -233,6 +370,7 @@ def download_and_parse_csv(url, department="Unknown", meeting_type="ministerial"
             purpose = (
                 row_lower.get("purpose of meeting", "") or
                 row_lower.get("purpose", "") or
+                row_lower.get("reason for meeting", "") or
                 ""
             ).strip()
             
