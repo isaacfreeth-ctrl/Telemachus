@@ -156,6 +156,9 @@ NL_INDEX_URL = "https://raw.githubusercontent.com/isaacfreeth-ctrl/Telemachus/ma
 # EC meetings - European Commission meetings with interest representatives
 EC_INDEX_URL = "https://raw.githubusercontent.com/isaacfreeth-ctrl/Telemachus/main/ec_meetings_index.json.gz"
 
+# MEP meetings - European Parliament MEP meetings (via Integrity Watch)
+MEP_INDEX_URL = "https://raw.githubusercontent.com/isaacfreeth-ctrl/Telemachus/main/mep_meetings_index.json.gz"
+
 CACHE_DIR = Path.home() / ".cache" / "eu_lobbying"
 
 
@@ -2822,6 +2825,145 @@ def search_ec_meetings_by_cabinet(search_term: str, months_back: int = None) -> 
 
 
 # ============================================================================
+# MEP MEETINGS - European Parliament MEP meetings (Integrity Watch)
+# ============================================================================
+
+_mep_index_cache = {"data": None, "loaded": False}
+
+
+def load_mep_index():
+    """Load the pre-built MEP meetings index."""
+    return _load_gzip_index(
+        "mep_meetings_index.json.gz", MEP_INDEX_URL,
+        _mep_index_cache, "MEP meetings"
+    )
+
+
+def search_mep_meetings(search_term: str, search_field: str = "organisation", months_back: int = None) -> dict:
+    """
+    Search MEP meetings from Integrity Watch.
+
+    Args:
+        search_term: Term to search for. Supports Boolean operators (AND, OR, NOT).
+        search_field: One of:
+            "organisation" - search the lobbyists/organisation name (default)
+            "mep"          - search by MEP name
+            "topic"        - search meeting title and dossier reference
+        months_back: If set, filter to meetings within last N months.
+
+    Examples:
+        search_mep_meetings("Google")
+        search_mep_meetings("Ursula von der Leyen", search_field="mep")
+        search_mep_meetings("AI Act", search_field="topic")
+    """
+    field_label = {"organisation": "organisation", "mep": "MEP name", "topic": "topic/dossier"}.get(search_field, search_field)
+    print(f"Searching MEP meetings for '{search_term}' (by {field_label})...")
+
+    index = load_mep_index()
+    if not index:
+        print("  No MEP index available")
+        return None
+
+    use_boolean = is_boolean_query(search_term)
+    search_lower = search_term.lower()
+    meetings = index["meetings"]
+
+    cutoff_date = None
+    if months_back:
+        from dateutil.relativedelta import relativedelta
+        cutoff_date = datetime.now() - relativedelta(months=months_back)
+
+    matches = []
+    for m in meetings:
+        if search_field == "mep":
+            field_value = m.get("mep", "") or ""
+        elif search_field == "topic":
+            field_value = (m.get("title", "") or "") + " " + (m.get("dossier", "") or "")
+        else:
+            # organisation: search across all lobbyists in array for best coverage
+            field_value = m.get("lobbyists", "") or ""
+
+        if use_boolean:
+            if not boolean_match(search_term, field_value):
+                continue
+        elif search_field == "topic":
+            if not re.search(r'\b' + re.escape(search_lower) + r'\b', field_value.lower()):
+                continue
+        else:
+            if search_lower not in field_value.lower():
+                continue
+
+        # Date filter
+        if cutoff_date:
+            date_str = m.get("date", "")
+            if "/" in date_str:
+                parts = date_str.split("/")
+                if len(parts) == 3:
+                    try:
+                        meeting_date = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
+                        if meeting_date < cutoff_date:
+                            continue
+                    except (ValueError, IndexError):
+                        pass
+
+        matches.append(m)
+
+    if not matches:
+        print(f"  No MEP meetings found for '{search_term}'")
+        return None
+
+    # Aggregate stats
+    by_mep = {}
+    by_group = {}
+    by_country = {}
+    by_year = {}
+    by_organisation = {}
+
+    for m in matches:
+        mep = m.get("mep", "Unknown")
+        group = m.get("group", "Unknown")
+        country = m.get("country", "Unknown")
+        date = m.get("date", "")
+
+        by_mep[mep] = by_mep.get(mep, 0) + 1
+        if group:
+            by_group[group] = by_group.get(group, 0) + 1
+        if country:
+            by_country[country] = by_country.get(country, 0) + 1
+
+        # Count each org separately from the array
+        for org in m.get("lobbyists_array", []):
+            if org:
+                by_organisation[org] = by_organisation.get(org, 0) + 1
+
+        if "/" in date:
+            parts = date.split("/")
+            year = parts[2] if len(parts) > 2 and len(parts[2]) == 4 else ""
+        else:
+            year = ""
+        if year:
+            by_year[year] = by_year.get(year, 0) + 1
+
+    result = {
+        "search_term": search_term,
+        "search_field": search_field,
+        "meetings": matches,
+        "meeting_count": len(matches),
+        "by_mep": dict(sorted(by_mep.items(), key=lambda x: -x[1])),
+        "by_group": dict(sorted(by_group.items(), key=lambda x: -x[1])),
+        "by_country": dict(sorted(by_country.items(), key=lambda x: -x[1])),
+        "by_year": dict(sorted(by_year.items(), key=lambda x: x[0], reverse=True)),
+        "by_organisation": dict(sorted(by_organisation.items(), key=lambda x: -x[1])),
+        "source_url": "https://www.integritywatch.eu/mepmeetings.php",
+        "data_coverage": months_back and f"Last {months_back} months" or index["metadata"].get("coverage", "2019-present"),
+        "index_date": index["metadata"].get("created", "Unknown"),
+    }
+
+    print(f"  Found {len(matches)} MEP meetings for '{search_term}'")
+    return result
+
+
+# ============================================================================
 # AUSTRIA - Lobbying- und Interessenvertretungs-Register
 # ============================================================================
 
@@ -3527,7 +3669,7 @@ def search_slovenia_register(search_term: str) -> dict:
     return result
 
 
-def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, uk_officials_data: dict = None, nl_data: dict = None, ec_data: dict = None, output_path: str = None, org_name: str = None):
+def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, uk_officials_data: dict = None, nl_data: dict = None, ec_data: dict = None, mep_data: dict = None, output_path: str = None, org_name: str = None):
     """Create combined Excel report."""
     wb = Workbook()
     
@@ -3543,6 +3685,7 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
     header_fill_cat = PatternFill("solid", fgColor="FCDD09")  # Catalonia Yellow (Senyera)
     header_fill_fi = PatternFill("solid", fgColor="003580")  # Finland Blue
     header_fill_si = PatternFill("solid", fgColor="005DA4")  # Slovenia Blue
+    header_fill_mep = PatternFill("solid", fgColor="003399")  # EP Dark Blue
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     cell_align = Alignment(vertical="top", wrap_text=True)
     border = Border(
@@ -5112,27 +5255,61 @@ def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: di
             ws_ec.cell(row=row_idx, column=8, value=meeting.get("location", ""))
         
         ws_ec.freeze_panes = 'A5'
-        
+
         # EC By-Organisation summary sheet
         by_org = ec_data.get("by_organisation", {})
         if by_org:
             ws_ec_org = wb.create_sheet("EC By Organisation")
             ws_ec_org['A1'] = f"EC Meetings by Organisation - {org_name}"
             ws_ec_org['A1'].font = Font(bold=True, size=14)
-            
+
             ws_ec_org.cell(row=3, column=1, value="Organisation").font = header_font
             ws_ec_org.cell(row=3, column=2, value="Meetings").font = header_font
             ws_ec_org.cell(row=3, column=1).fill = header_fill_ec
             ws_ec_org.cell(row=3, column=2).fill = header_fill_ec
-            
+
             for row_idx, (org, count) in enumerate(by_org.items(), 4):
                 ws_ec_org.cell(row=row_idx, column=1, value=org)
                 ws_ec_org.cell(row=row_idx, column=2, value=count)
-            
+
             ws_ec_org.column_dimensions['A'].width = 50
             ws_ec_org.column_dimensions['B'].width = 15
             ws_ec_org.freeze_panes = 'A4'
-    
+
+    # === MEP MEETINGS SHEET ===
+    if mep_data and mep_data.get("meetings"):
+        ws_mep = wb.create_sheet("MEP Meetings")
+        ws_mep['A1'] = f"MEP Meetings - {org_name}"
+        ws_mep['A1'].font = Font(bold=True, size=14)
+        ws_mep.merge_cells('A1:H1')
+        ws_mep['A2'] = f"Source: Integrity Watch (Transparency International EU) | {mep_data.get('data_coverage', '2019-present')}"
+        ws_mep['A2'].font = Font(italic=True, size=10)
+
+        mep_meetings = mep_data["meetings"]
+
+        cols = [
+            ("Date", 12), ("MEP", 30), ("Group", 10),
+            ("Country", 12), ("Organisation(s)", 45),
+            ("Subject/Title", 40), ("Dossier", 20), ("Location", 15)
+        ]
+        for col_idx, (header, width) in enumerate(cols, 1):
+            cell = ws_mep.cell(row=4, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill_mep
+            ws_mep.column_dimensions[get_column_letter(col_idx)].width = width
+
+        for row_idx, meeting in enumerate(mep_meetings[:5000], 5):
+            ws_mep.cell(row=row_idx, column=1, value=meeting.get("date", ""))
+            ws_mep.cell(row=row_idx, column=2, value=meeting.get("mep", ""))
+            ws_mep.cell(row=row_idx, column=3, value=meeting.get("group", ""))
+            ws_mep.cell(row=row_idx, column=4, value=meeting.get("country", ""))
+            ws_mep.cell(row=row_idx, column=5, value=meeting.get("lobbyists", ""))
+            ws_mep.cell(row=row_idx, column=6, value=meeting.get("title", ""))
+            ws_mep.cell(row=row_idx, column=7, value=meeting.get("dossier", ""))
+            ws_mep.cell(row=row_idx, column=8, value=meeting.get("location", ""))
+
+        ws_mep.freeze_panes = 'A5'
+
     wb.save(output_path)
     print(f"\nReport saved to: {output_path}")
 

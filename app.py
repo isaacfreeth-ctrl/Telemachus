@@ -35,6 +35,7 @@ from eu_lobbying_core import (
     search_ec_meetings_by_organisation,
     search_ec_meetings_by_topic,
     search_ec_meetings_by_cabinet,
+    search_mep_meetings,
     create_excel_report,
 )
 
@@ -319,6 +320,7 @@ def generate_full_excel(search_term: str, results: dict) -> BytesIO:
             uk_officials_data=results.get("uk_officials"),
             nl_data=results.get("netherlands"),
             ec_data=results.get("ec_meetings"),
+            mep_data=results.get("mep_meetings"),
             output_path=tmp_path,
             org_name=search_term
         )
@@ -783,7 +785,65 @@ def display_summary(search_term: str, results: dict):
                         st.caption(f"...and {len(by_org) - 15} more. Download the report for the full list.")
             
             st.caption(f"📅 Data coverage: {data.get('data_coverage', '2014-present')} | Source: EC Open Data Portal")
-    
+
+    # MEP Meetings
+    if results.get("mep_meetings"):
+        data = results["mep_meetings"]
+        mep_search_field = data.get("search_field", "organisation")
+        meetings = data.get("meetings", [])
+        by_mep = data.get("by_mep", {})
+        by_group = data.get("by_group", {})
+        by_org = data.get("by_organisation", {})
+
+        if mep_search_field == "mep":
+            expander_title = "🇪🇺 **MEP Meetings (Integrity Watch)** ✅"
+        elif mep_search_field == "topic":
+            expander_title = "🇪🇺 **MEP Meetings on Topic** ✅"
+        else:
+            expander_title = "🇪🇺 **MEP Meetings (Integrity Watch)** ✅"
+
+        with st.expander(expander_title, expanded=True):
+            cols = st.columns(4)
+            with cols[0]:
+                st.metric("Total MEP Meetings", len(meetings))
+            with cols[1]:
+                st.metric("MEPs", len(by_mep))
+            with cols[2]:
+                st.metric("Organisations", len(by_org))
+            with cols[3]:
+                st.metric("Political Groups", len(by_group))
+
+            if mep_search_field == "organisation":
+                if by_mep:
+                    st.markdown("**MEPs who took meetings:**")
+                    for mep, count in list(by_mep.items())[:15]:
+                        st.write(f"• **{mep}** ({count} meetings)")
+                    if len(by_mep) > 15:
+                        st.caption(f"...and {len(by_mep) - 15} more.")
+                if by_group:
+                    st.markdown("**By political group:**")
+                    for group, count in list(by_group.items())[:10]:
+                        st.write(f"• {group}: {count} meetings")
+            elif mep_search_field == "mep":
+                if by_org:
+                    st.markdown("**Top organisations met:**")
+                    for org, count in list(by_org.items())[:15]:
+                        st.write(f"• {org}: {count} meetings")
+                    if len(by_org) > 15:
+                        st.caption(f"...and {len(by_org) - 15} more.")
+            else:
+                # topic mode
+                if by_mep:
+                    st.markdown("**MEPs who took meetings on this topic:**")
+                    for mep, count in list(by_mep.items())[:15]:
+                        st.write(f"• **{mep}** ({count} meetings)")
+                if by_org:
+                    st.markdown("**Organisations involved:**")
+                    for org, count in list(by_org.items())[:10]:
+                        st.write(f"• {org}: {count} meetings")
+
+            st.caption(f"📅 Data coverage: {data.get('data_coverage', '2019-present')} | Source: Integrity Watch (Transparency International EU)")
+
     # Austria
     if results.get("austria"):
         data = results["austria"]
@@ -917,6 +977,7 @@ def preview_matches(search_term: str, selected: dict, progress_callback=None, uk
         "germany": [],
         "uk": None,  # UK uses index, returns full results directly
         "ec_meetings": None,  # EC meetings by representative (minister mode)
+        "mep_meetings": None,  # MEP meetings (Integrity Watch)
         "ireland": None,
         "netherlands": None,
         "austria": None,
@@ -1022,10 +1083,21 @@ def preview_matches(search_term: str, selected: dict, progress_callback=None, uk
             progress_callback("🇸🇮 Searching Slovenia...", done/total)
         matches["slovenia"] = search_slovenia_register(search_term)
         done += 1
-    
+
+    # MEP meetings - search across all modes
+    if progress_callback:
+        progress_callback("🇪🇺 Searching MEP meetings (Integrity Watch)...", done/total)
+    if minister_mode:
+        matches["mep_meetings"] = search_mep_meetings(search_term, search_field="mep", months_back=uk_months_back)
+    elif topic_mode:
+        matches["mep_meetings"] = search_mep_meetings(search_term, search_field="topic", months_back=uk_months_back)
+    else:
+        matches["mep_meetings"] = search_mep_meetings(search_term, search_field="organisation", months_back=uk_months_back)
+    done += 1
+
     if progress_callback:
         progress_callback("✅ Search complete!", 1.0)
-    
+
     return matches
 
 
@@ -1039,6 +1111,7 @@ def fetch_selected_data(selections: dict, other_results: dict, progress_callback
         "uk": None,
         "uk_officials": None,
         "ec_meetings": None,
+        "mep_meetings": None,
         "ireland": None,
         "netherlands": None,
         "austria": None,
@@ -1047,13 +1120,15 @@ def fetch_selected_data(selections: dict, other_results: dict, progress_callback
         "slovenia": None,
         "_warnings": [],
     }
-    
+
     # Include index-based jurisdictions only if user selected them
     if selections.get("uk"):
         results["uk"] = other_results.get("uk")
         results["uk_officials"] = other_results.get("uk_officials")
     if selections.get("ec_meetings"):
         results["ec_meetings"] = other_results.get("ec_meetings")
+    if selections.get("mep_meetings"):
+        results["mep_meetings"] = other_results.get("mep_meetings")
     if selections.get("ireland"):
         results["ireland"] = other_results.get("ireland")
     if selections.get("netherlands"):
@@ -1535,7 +1610,38 @@ if st.session_state.matches and st.session_state.search_term_used:
                 st.caption(f"**Top orgs met:** {org_summary}")
             
             user_selections["ec_meetings"] = ec_include
-    
+
+    # MEP meetings matches
+    if matches.get("mep_meetings") and matches["mep_meetings"].get("meetings"):
+        mep_data = matches["mep_meetings"]
+        mep_meetings = mep_data["meetings"]
+        by_mep = mep_data.get("by_mep", {})
+        by_org = mep_data.get("by_organisation", {})
+        search_field = mep_data.get("search_field", "organisation")
+
+        if search_field == "mep":
+            expander_label = f"🇪🇺 **MEP Meetings (Integrity Watch)** - {len(mep_meetings)} meetings by {len(by_mep)} MEPs"
+        elif search_field == "topic":
+            expander_label = f"🇪🇺 **MEP Meetings on Topic** - {len(mep_meetings)} meetings"
+        else:
+            expander_label = f"🇪🇺 **MEP Meetings (Integrity Watch)** - {len(mep_meetings)} meetings with {len(by_mep)} MEPs"
+
+        with st.expander(expander_label, expanded=True):
+            mep_include = st.checkbox(
+                f"Include MEP meetings ({len(mep_meetings)} meetings)",
+                value=True,
+                key="mep_meetings_include"
+            )
+
+            if search_field == "organisation" and by_mep:
+                top_meps = list(by_mep.items())[:5]
+                st.caption("**MEPs met:** " + ", ".join(f"{name}: {count}" for name, count in top_meps))
+            elif search_field == "mep" and by_org:
+                top_orgs = list(by_org.items())[:5]
+                st.caption("**Top orgs met:** " + ", ".join(f"{org}: {count}" for org, count in top_orgs))
+
+            user_selections["mep_meetings"] = mep_include
+
     # Ireland matches
     if matches.get("ireland") and matches["ireland"].get("returns"):
         ie_data = matches["ireland"]
@@ -1655,6 +1761,8 @@ if st.session_state.matches and st.session_state.search_term_used:
     if user_selections.get("uk"):
         total_jurisdictions += 1
     if user_selections.get("ec_meetings"):
+        total_jurisdictions += 1
+    if user_selections.get("mep_meetings"):
         total_jurisdictions += 1
     if user_selections.get("ireland"):
         total_jurisdictions += 1
