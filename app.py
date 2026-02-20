@@ -1057,18 +1057,18 @@ def display_summary(search_term: str, results: dict):
             with cols[0]:
                 st.metric("Registrants", data.get("entry_count", len(entries)))
             with cols[1]:
-                st.metric("Total Returns", data.get("total_returns", 0))
+                st.metric("Categories", len(data.get("by_category", {})))
 
             if entries:
                 st.write("**Matching registrants:**")
                 for entry in entries[:10]:
-                    returns = entry.get("returns_count", 0)
                     url = entry.get("detail_url", "")
-                    returns_str = f" ({returns} returns)" if returns else ""
+                    cat = entry.get("category", "")
+                    cat_str = f" · {cat}" if cat else ""
                     if url:
-                        st.markdown(f"• [{entry['name']}]({url}){returns_str}")
+                        st.markdown(f"• [{entry['name']}]({url}){cat_str}")
                     else:
-                        st.write(f"• {entry['name']}{returns_str}")
+                        st.write(f"• {entry['name']}{cat_str}")
 
             st.caption(f"📅 {data.get('data_coverage', '2018-present')} | {data.get('note', '')}")
 
@@ -1900,7 +1900,7 @@ if st.session_state.matches and st.session_state.search_term_used:
         sc_data = matches["scotland"]
         with st.expander(f"🏴󠁧󠁢󠁳󠁣󠁴󠁿 **Scotland** - {sc_data['entry_count']} entries found", expanded=True):
             sc_include = st.checkbox(
-                f"Include Scotland ({sc_data['entry_count']} registrants, {sc_data.get('total_returns', 0)} total returns)",
+                f"Include Scotland ({sc_data['entry_count']} registrants)",
                 value=True,
                 key="scotland_include"
             )

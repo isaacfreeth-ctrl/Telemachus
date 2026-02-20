@@ -3976,7 +3976,7 @@ def search_lithuania_register(search_term: str) -> dict:
 # SCOTLAND - Lobbying Register (lobbying.scot)
 # =============================================================================
 
-SCOTLAND_SEARCH_URL = "https://lobbying.scot/SPS/LobbyingRegister/SearchLobbyingRegisterResults"
+SCOTLAND_BASE_URL = "https://lobbying.scot/SPS/LobbyingRegister/SearchLobbyingRegister"
 SCOTLAND_CACHE_DIR = Path.home() / ".cache" / "eu_lobbying" / "scotland"
 
 
@@ -3988,6 +3988,9 @@ def search_scotland_register(search_term: str) -> dict:
     face-to-face communications with MSPs, Ministers, and Special Advisers
     from March 2018 onwards.
 
+    Uses a session + POST with CSRF token (required by the site).
+    Results are structured dl/dt/dd blocks, not a table.
+
     Supports Boolean search operators (AND, OR, NOT, quotes, parentheses).
 
     Data source: https://lobbying.scot
@@ -3997,25 +4000,14 @@ def search_scotland_register(search_term: str) -> dict:
 
     SCOTLAND_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # For OR queries, search each term separately
     use_boolean = is_boolean_query(search_term)
 
-    if use_boolean and not is_boolean_query(search_term):
-        terms = [search_term]
-    else:
-        terms = [search_term]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.5",
-        "Referer": "https://lobbying.scot/",
-    }
-
-    # Use simple term for the HTTP query (boolean logic applied locally)
-    # Extract the core search term(s) for the HTTP request
+    # Strip boolean operators for the HTTP query; apply them locally
     simple_term = re.sub(r'\b(AND|OR|NOT)\b', ' ', search_term, flags=re.IGNORECASE)
-    simple_term = re.sub(r'[()"]', '', simple_term).strip().split()[0] if simple_term.strip() else search_term
+    simple_term = re.sub(r'[()"]', '', simple_term).strip()
+    # Use first word only for the server query if multi-word boolean
+    if use_boolean and simple_term:
+        simple_term = simple_term.split()[0]
 
     cache_key = re.sub(r'[^a-zA-Z0-9]', '_', search_term)[:50]
     cache_file = SCOTLAND_CACHE_DIR / f"search_{cache_key}.html"
@@ -4025,77 +4017,81 @@ def search_scotland_register(search_term: str) -> dict:
             html_content = f.read()
     else:
         try:
-            response = requests.get(
-                SCOTLAND_SEARCH_URL,
-                params={"registrantName": simple_term, "pageSize": 100},
-                headers=headers,
-                timeout=30,
-            )
-            response.raise_for_status()
-            html_content = response.text
+            session = requests.Session()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-GB,en;q=0.5",
+            }
+            # GET the form page to obtain the CSRF token
+            get_resp = session.get(SCOTLAND_BASE_URL, headers=headers, timeout=20)
+            get_resp.raise_for_status()
+
+            token_match = re.search(r'__RequestVerificationToken[^>]+value="([^"]+)"', get_resp.text)
+            if not token_match:
+                print("  Could not find Scotland CSRF token")
+                return None
+
+            # POST the search form
+            post_data = {
+                "__RequestVerificationToken": token_match.group(1),
+                "RegistrantName": simple_term,
+                "SearchByRegisteredUsers": "true",
+            }
+            headers["Referer"] = SCOTLAND_BASE_URL
+            post_resp = session.post(SCOTLAND_BASE_URL, data=post_data, headers=headers, timeout=20)
+            post_resp.raise_for_status()
+            html_content = post_resp.text
+
             with open(cache_file, 'w', encoding='utf-8') as f:
                 f.write(html_content)
         except Exception as e:
             print(f"  Error fetching Scotland register: {e}")
             return None
 
-    # Parse results from HTML
-    # The site returns a table of registrant names and return counts
+    # Results are rendered as table rows:
+    # <tr><td>
+    #   <span>Registrant name : <span>Shell U.K. Limited</span></span>
+    #   <span>Registrant category : <span>Active</span></span>
+    #   <span>Lobbying role : <span>Company</span></span>
+    #   <a href="/SPS/Manage/RegisteredUserSearchDetail/...">Click here for more information</a>
+    # </td></tr>
     entries = []
 
-    # Look for result rows: registrant name, return count, link
+    if '0 Entries' in html_content or 'No records found' in html_content:
+        print(f"  No matches found for '{search_term}' in Scotland register")
+        return None
+
+    # Parse each result row
     row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
-    td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
-    a_pattern = re.compile(r'href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL)
+    span_label_pattern = re.compile(r'(Registrant name|Business name|Registrant category|Lobbying role)\s*:\s*<span>([^<]*)</span>', re.IGNORECASE)
+    a_href_pattern = re.compile(r'href="(/SPS/Manage/[^"]+)"')
 
     for row_match in row_pattern.finditer(html_content):
         row_html = row_match.group(1)
-        cells = td_pattern.findall(row_html)
-        if len(cells) < 2:
+
+        fields = {}
+        for label, value in span_label_pattern.findall(row_html):
+            fields[label.lower().strip()] = value.strip()
+
+        name = fields.get('registrant name', '')
+        if not name:
             continue
 
-        name_cell = cells[0]
-        name_text = re.sub(r'<[^>]+>', '', name_cell).strip()
-
-        if not name_text or name_text.lower() in ('registrant', 'name', 'organisation'):
+        # Apply boolean filter locally
+        if use_boolean and not boolean_match(search_term, name):
             continue
 
-        # Extract link
-        link_match = a_pattern.search(name_cell)
-        detail_url = ""
-        if link_match:
-            href = link_match.group(1)
-            if not href.startswith('http'):
-                href = f"https://lobbying.scot{href}"
-            detail_url = href
-
-        # Extract return count (second cell usually)
-        returns_text = re.sub(r'<[^>]+>', '', cells[1]).strip() if len(cells) > 1 else '0'
-        try:
-            returns_count = int(re.search(r'\d+', returns_text).group()) if re.search(r'\d+', returns_text) else 0
-        except Exception:
-            returns_count = 0
-
-        # Apply boolean filter locally if needed
-        if use_boolean:
-            if not boolean_match(search_term, name_text):
-                continue
+        # Extract detail URL
+        href_match = a_href_pattern.search(row_html)
+        detail_url = f"https://lobbying.scot{href_match.group(1)}" if href_match else ""
 
         entries.append({
-            'name': name_text,
-            'returns_count': returns_count,
+            'name': name,
+            'business_name': fields.get('business name', ''),
+            'category': fields.get('lobbying role', fields.get('registrant category', '')),
             'detail_url': detail_url,
         })
-
-    # Also check for a "no results" message
-    if not entries:
-        if 'no results' in html_content.lower() or 'no lobbying' in html_content.lower():
-            print(f"  No matches found for '{search_term}' in Scotland register")
-            return None
-        # If we got HTML but couldn't parse it (page structure changed), return None
-        if len(html_content) < 500:
-            print(f"  Scotland register returned unexpected response")
-            return None
 
     if not entries:
         print(f"  No matches found for '{search_term}' in Scotland register")
@@ -4103,13 +4099,16 @@ def search_scotland_register(search_term: str) -> dict:
 
     print(f"  Found {len(entries)} matching registrant(s)")
 
-    total_returns = sum(e.get('returns_count', 0) for e in entries)
+    by_category = {}
+    for e in entries:
+        cat = e.get('category', 'Unknown')
+        by_category[cat] = by_category.get(cat, 0) + 1
 
     return {
         "search_term": search_term,
         "entries": entries,
         "entry_count": len(entries),
-        "total_returns": total_returns,
+        "by_category": by_category,
         "data_coverage": "2018-present",
         "note": "Scotland Lobbying Register (lobbying.scot). Covers face-to-face regulated lobbying of MSPs, Ministers, and Special Advisers. Administered by the Scottish Parliament."
     }
