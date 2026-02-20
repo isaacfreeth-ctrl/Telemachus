@@ -3665,8 +3665,454 @@ def search_slovenia_register(search_term: str) -> dict:
         "data_coverage": "2010-present",
         "note": "Slovenia Register of Lobbyists (KPK). Lists individual lobbyists, not companies. Cross-reference with interest organization reports for company activities."
     }
-    
+
     return result
+
+
+# =============================================================================
+# LATVIA - Interest Representatives Register (Uzņēmumu Reģistrs)
+# =============================================================================
+
+LATVIA_CSV_URL = "https://dati.ur.gov.lv/register/interest_representatives.csv"
+LATVIA_CACHE_DIR = Path.home() / ".cache" / "eu_lobbying" / "latvia"
+
+
+def get_latvia_representatives():
+    """
+    Download and cache Latvia's interest representatives CSV.
+    Updated daily at dati.ur.gov.lv. Register launched September 2025.
+
+    CSV columns (semicolon-separated):
+    date_created, date_updated, registration_number, legal_name, legal_form,
+    legal_entity_country, natural_person_name, natural_person_surname,
+    identity_number, birth_date, document_number, natural_person_country, issuer
+    """
+    LATVIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = LATVIA_CACHE_DIR / "interest_representatives.csv"
+
+    # Refresh cache if older than 24 hours
+    if cache_file.exists() and (datetime.now().timestamp() - cache_file.stat().st_mtime) < 86400:
+        with open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    else:
+        print("  Fetching Latvia interest representatives CSV...")
+        try:
+            response = requests.get(
+                LATVIA_CSV_URL,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; LobbyingTracker/1.0)"},
+                timeout=30
+            )
+            response.raise_for_status()
+            content = response.text
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            print(f"  Error fetching Latvia CSV: {e}")
+            return []
+
+    representatives = []
+    reader = csv.DictReader(io.StringIO(content), delimiter=';')
+    for row in reader:
+        rep = {
+            'date_created': row.get('date_created', ''),
+            'date_updated': row.get('date_updated', ''),
+            'registration_number': row.get('registration_number', ''),
+            'legal_name': row.get('legal_name', ''),
+            'legal_form': row.get('legal_form', ''),
+            'legal_entity_country': row.get('legal_entity_country', ''),
+            'natural_person_name': row.get('natural_person_name', ''),
+            'natural_person_surname': row.get('natural_person_surname', ''),
+            'natural_person_country': row.get('natural_person_country', ''),
+        }
+        representatives.append(rep)
+
+    return representatives
+
+
+def search_latvia_register(search_term: str) -> dict:
+    """
+    Search Latvia's Interest Representatives Register.
+
+    Administered by the Enterprise Register of Latvia (Uzņēmumu Reģistrs).
+    Register launched September 1, 2025 under the Law on Transparency of
+    Representation of Interests.
+
+    Supports Boolean search operators (AND, OR, NOT, quotes, parentheses).
+
+    Searches against:
+    - Legal name (organisations)
+    - Natural person name/surname (individuals)
+
+    Data source: https://dati.ur.gov.lv/register/
+    """
+    print(f"Searching Latvia register for '{search_term}'...")
+
+    representatives = get_latvia_representatives()
+    if not representatives:
+        print("  Could not fetch Latvia register data")
+        return None
+
+    use_boolean = is_boolean_query(search_term)
+    search_lower = search_term.lower()
+    matches = []
+
+    for rep in representatives:
+        full_name = f"{rep.get('natural_person_name', '')} {rep.get('natural_person_surname', '')}".strip()
+        searchable = " ".join([
+            rep.get('legal_name', ''),
+            full_name,
+        ])
+
+        if use_boolean:
+            if boolean_match(search_term, searchable):
+                matches.append(rep)
+        else:
+            if fuzzy_contains(search_lower, rep.get('legal_name', '')):
+                matches.append(rep)
+                continue
+            if full_name and fuzzy_contains(search_lower, full_name):
+                matches.append(rep)
+
+    if not matches:
+        print(f"  No matches found for '{search_term}' in Latvia register")
+        return None
+
+    print(f"  Found {len(matches)} matching registrant(s)")
+
+    by_legal_form = {}
+    by_country = {}
+    entries = []
+
+    for m in matches:
+        full_name = f"{m.get('natural_person_name', '')} {m.get('natural_person_surname', '')}".strip()
+        display_name = m.get('legal_name', '') or full_name
+        legal_form = m.get('legal_form', 'Unknown')
+        country = m.get('legal_entity_country', '') or m.get('natural_person_country', 'LV')
+
+        entries.append({
+            'name': display_name,
+            'registration_number': m.get('registration_number', ''),
+            'legal_form': legal_form,
+            'country': country,
+            'date_registered': m.get('date_created', ''),
+            'date_updated': m.get('date_updated', ''),
+        })
+
+        by_legal_form[legal_form] = by_legal_form.get(legal_form, 0) + 1
+        by_country[country] = by_country.get(country, 0) + 1
+
+    return {
+        "search_term": search_term,
+        "entries": entries,
+        "entry_count": len(entries),
+        "total_registered": len(representatives),
+        "by_legal_form": by_legal_form,
+        "by_country": by_country,
+        "data_coverage": "2025-present",
+        "note": "Latvia Interest Representatives Register (Uzņēmumu Reģistrs). Launched September 2025. All entities must register who represent interests before public authorities."
+    }
+
+
+# =============================================================================
+# LITHUANIA - Lobbyist Register (VTEK / Skaidris)
+# =============================================================================
+
+LITHUANIA_API_URL = "https://skaidris.vtek.lt/api/v1/lobbyistDeclaration/public"
+LITHUANIA_CACHE_DIR = Path.home() / ".cache" / "eu_lobbying" / "lithuania"
+
+
+def get_lithuania_lobbyists():
+    """
+    Fetch Lithuania's lobbyist declarations from the VTEK Skaidris system.
+    Tries JSON API first, falls back to HTML scraping.
+    """
+    LITHUANIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = LITHUANIA_CACHE_DIR / "lobbyists.json"
+
+    if cache_file.exists() and (datetime.now().timestamp() - cache_file.stat().st_mtime) < 86400:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/html, */*",
+    }
+
+    # Try JSON API endpoint
+    try:
+        response = requests.get(
+            LITHUANIA_API_URL,
+            headers=headers,
+            timeout=30,
+            params={"page": 0, "size": 1000}
+        )
+        if response.status_code == 200:
+            data = response.json()
+            lobbyists = data if isinstance(data, list) else data.get('content', data.get('data', []))
+            if lobbyists:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(lobbyists, f, ensure_ascii=False)
+                return lobbyists
+    except Exception:
+        pass
+
+    # Fallback: scrape the public HTML list
+    try:
+        response = requests.get(
+            "https://skaidris.vtek.lt/public/lobbyistDeclaration/listPublic",
+            headers=headers,
+            timeout=30
+        )
+        if response.status_code == 200:
+            html = response.text
+            # Extract entries from HTML table rows
+            lobbyists = []
+            row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+            td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
+
+            for row_match in row_pattern.finditer(html):
+                row_html = row_match.group(1)
+                cells = td_pattern.findall(row_html)
+                if len(cells) >= 2:
+                    name = re.sub(r'<[^>]+>', '', cells[0]).strip()
+                    employer = re.sub(r'<[^>]+>', '', cells[1]).strip() if len(cells) > 1 else ''
+                    if name and name not in ('Vardas Pavardė', 'Name', ''):
+                        lobbyists.append({
+                            'name': name,
+                            'employer': employer,
+                            'raw': cells
+                        })
+
+            if lobbyists:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(lobbyists, f, ensure_ascii=False)
+                return lobbyists
+    except Exception as e:
+        print(f"  Lithuania scrape fallback failed: {e}")
+
+    return []
+
+
+def search_lithuania_register(search_term: str) -> dict:
+    """
+    Search Lithuania's Lobbyist Register (VTEK Skaidris system).
+
+    Administered by the Chief Official Ethics Commission (VTEK).
+    Covers professional lobbyists registered under the Lobbying Law.
+
+    Note: Register tracks individual lobbyists and the organisations
+    they lobby for. Search by lobbyist name or employer/client name.
+
+    Supports Boolean search operators (AND, OR, NOT, quotes, parentheses).
+
+    Data source: https://skaidris.vtek.lt/public/lobbyistDeclaration/listPublic
+    """
+    print(f"Searching Lithuania register for '{search_term}'...")
+
+    lobbyists = get_lithuania_lobbyists()
+    if not lobbyists:
+        print("  Could not fetch Lithuania register data")
+        return None
+
+    use_boolean = is_boolean_query(search_term)
+    search_lower = search_term.lower()
+    matches = []
+
+    for entry in lobbyists:
+        # Handle both API JSON and scraped HTML formats
+        name = entry.get('name', '') or entry.get('fullName', '') or entry.get('firstName', '')
+        last = entry.get('lastName', '') or entry.get('surname', '')
+        if last:
+            name = f"{name} {last}".strip()
+        employer = entry.get('employer', '') or entry.get('employerName', '') or entry.get('organization', '')
+        client = entry.get('client', '') or entry.get('clientName', '') or ''
+
+        searchable = " ".join([name, employer, client])
+
+        if use_boolean:
+            if boolean_match(search_term, searchable):
+                matches.append({**entry, '_name': name, '_employer': employer, '_client': client})
+        else:
+            if (fuzzy_contains(search_lower, name) or
+                    fuzzy_contains(search_lower, employer) or
+                    (client and fuzzy_contains(search_lower, client))):
+                matches.append({**entry, '_name': name, '_employer': employer, '_client': client})
+
+    if not matches:
+        print(f"  No matches found for '{search_term}' in Lithuania register")
+        return None
+
+    print(f"  Found {len(matches)} matching lobbyist(s)")
+
+    entries = []
+    by_employer = {}
+
+    for m in matches:
+        name = m.get('_name', '')
+        employer = m.get('_employer', '')
+        client = m.get('_client', '')
+
+        entries.append({
+            'name': name,
+            'employer': employer,
+            'client': client,
+        })
+
+        if employer:
+            by_employer[employer] = by_employer.get(employer, 0) + 1
+
+    return {
+        "search_term": search_term,
+        "entries": entries,
+        "entry_count": len(entries),
+        "total_registered": len(lobbyists),
+        "by_employer": by_employer,
+        "data_coverage": "2001-present",
+        "note": "Lithuania Lobbyist Register (VTEK/Skaidris). Lists individual licensed lobbyists and their clients. Administered by the Chief Official Ethics Commission."
+    }
+
+
+# =============================================================================
+# SCOTLAND - Lobbying Register (lobbying.scot)
+# =============================================================================
+
+SCOTLAND_SEARCH_URL = "https://lobbying.scot/SPS/LobbyingRegister/SearchLobbyingRegisterResults"
+SCOTLAND_CACHE_DIR = Path.home() / ".cache" / "eu_lobbying" / "scotland"
+
+
+def search_scotland_register(search_term: str) -> dict:
+    """
+    Search Scotland's Lobbying Register (lobbying.scot).
+
+    Administered by the Scottish Parliament. Covers regulated lobbying:
+    face-to-face communications with MSPs, Ministers, and Special Advisers
+    from March 2018 onwards.
+
+    Supports Boolean search operators (AND, OR, NOT, quotes, parentheses).
+
+    Data source: https://lobbying.scot
+    Administered by: Scottish Parliament Lobbying Registrar
+    """
+    print(f"Searching Scotland register for '{search_term}'...")
+
+    SCOTLAND_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # For OR queries, search each term separately
+    use_boolean = is_boolean_query(search_term)
+
+    if use_boolean and not is_boolean_query(search_term):
+        terms = [search_term]
+    else:
+        terms = [search_term]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.5",
+        "Referer": "https://lobbying.scot/",
+    }
+
+    # Use simple term for the HTTP query (boolean logic applied locally)
+    # Extract the core search term(s) for the HTTP request
+    simple_term = re.sub(r'\b(AND|OR|NOT)\b', ' ', search_term, flags=re.IGNORECASE)
+    simple_term = re.sub(r'[()"]', '', simple_term).strip().split()[0] if simple_term.strip() else search_term
+
+    cache_key = re.sub(r'[^a-zA-Z0-9]', '_', search_term)[:50]
+    cache_file = SCOTLAND_CACHE_DIR / f"search_{cache_key}.html"
+
+    if cache_file.exists() and (datetime.now().timestamp() - cache_file.stat().st_mtime) < 3600:
+        with open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
+            html_content = f.read()
+    else:
+        try:
+            response = requests.get(
+                SCOTLAND_SEARCH_URL,
+                params={"registrantName": simple_term, "pageSize": 100},
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            html_content = response.text
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+        except Exception as e:
+            print(f"  Error fetching Scotland register: {e}")
+            return None
+
+    # Parse results from HTML
+    # The site returns a table of registrant names and return counts
+    entries = []
+
+    # Look for result rows: registrant name, return count, link
+    row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+    td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
+    a_pattern = re.compile(r'href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL)
+
+    for row_match in row_pattern.finditer(html_content):
+        row_html = row_match.group(1)
+        cells = td_pattern.findall(row_html)
+        if len(cells) < 2:
+            continue
+
+        name_cell = cells[0]
+        name_text = re.sub(r'<[^>]+>', '', name_cell).strip()
+
+        if not name_text or name_text.lower() in ('registrant', 'name', 'organisation'):
+            continue
+
+        # Extract link
+        link_match = a_pattern.search(name_cell)
+        detail_url = ""
+        if link_match:
+            href = link_match.group(1)
+            if not href.startswith('http'):
+                href = f"https://lobbying.scot{href}"
+            detail_url = href
+
+        # Extract return count (second cell usually)
+        returns_text = re.sub(r'<[^>]+>', '', cells[1]).strip() if len(cells) > 1 else '0'
+        try:
+            returns_count = int(re.search(r'\d+', returns_text).group()) if re.search(r'\d+', returns_text) else 0
+        except Exception:
+            returns_count = 0
+
+        # Apply boolean filter locally if needed
+        if use_boolean:
+            if not boolean_match(search_term, name_text):
+                continue
+
+        entries.append({
+            'name': name_text,
+            'returns_count': returns_count,
+            'detail_url': detail_url,
+        })
+
+    # Also check for a "no results" message
+    if not entries:
+        if 'no results' in html_content.lower() or 'no lobbying' in html_content.lower():
+            print(f"  No matches found for '{search_term}' in Scotland register")
+            return None
+        # If we got HTML but couldn't parse it (page structure changed), return None
+        if len(html_content) < 500:
+            print(f"  Scotland register returned unexpected response")
+            return None
+
+    if not entries:
+        print(f"  No matches found for '{search_term}' in Scotland register")
+        return None
+
+    print(f"  Found {len(entries)} matching registrant(s)")
+
+    total_returns = sum(e.get('returns_count', 0) for e in entries)
+
+    return {
+        "search_term": search_term,
+        "entries": entries,
+        "entry_count": len(entries),
+        "total_returns": total_returns,
+        "data_coverage": "2018-present",
+        "note": "Scotland Lobbying Register (lobbying.scot). Covers face-to-face regulated lobbying of MSPs, Ministers, and Special Advisers. Administered by the Scottish Parliament."
+    }
 
 
 def create_excel_report(eu_data: dict, fr_data: dict, de_data: dict, ie_data: dict, uk_data: dict, at_data: dict, cat_data: dict, fi_data: dict, si_data: dict = None, uk_officials_data: dict = None, nl_data: dict = None, ec_data: dict = None, mep_data: dict = None, output_path: str = None, org_name: str = None):

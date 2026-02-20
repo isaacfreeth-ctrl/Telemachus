@@ -25,6 +25,9 @@ from eu_lobbying_core import (
     search_catalonia_register,
     search_finland_register,
     search_slovenia_register,
+    search_latvia_register,
+    search_lithuania_register,
+    search_scotland_register,
     search_ireland_register,
     fetch_ireland_data,
     search_ireland_lobbying,
@@ -105,6 +108,24 @@ JURISDICTIONS = {
         "note": "Lists individual lobbyists - search by name/employer",
         "default": True,
     },
+    "latvia": {
+        "name": "Latvia",
+        "flag": "🇱🇻",
+        "note": "Interest Representatives Register. Launched Sept 2025.",
+        "default": True,
+    },
+    "lithuania": {
+        "name": "Lithuania",
+        "flag": "🇱🇹",
+        "note": "VTEK Skaidris lobbyist register - individual lobbyists",
+        "default": True,
+    },
+    "scotland": {
+        "name": "Scotland",
+        "flag": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+        "note": "Scottish Parliament lobbying register (2018-present)",
+        "default": True,
+    },
 }
 
 
@@ -117,7 +138,7 @@ def run_search(search_term: str, selected: dict, progress_callback=None, uk_mont
     
     results = {
         "eu": None,
-        "france": None, 
+        "france": None,
         "germany": None,
         "uk": None,
         "ireland": None,
@@ -126,6 +147,9 @@ def run_search(search_term: str, selected: dict, progress_callback=None, uk_mont
         "catalonia": None,
         "finland": None,
         "slovenia": None,
+        "latvia": None,
+        "lithuania": None,
+        "scotland": None,
     }
     
     total = sum(selected.values())
@@ -291,10 +315,31 @@ def run_search(search_term: str, selected: dict, progress_callback=None, uk_mont
             progress_callback("🇸🇮 Searching Slovenia...", done/total)
         results["slovenia"] = search_slovenia_register(search_term)
         done += 1
-    
+
+    # Latvia
+    if selected.get("latvia"):
+        if progress_callback:
+            progress_callback("🇱🇻 Searching Latvia...", done/total)
+        results["latvia"] = search_latvia_register(search_term)
+        done += 1
+
+    # Lithuania
+    if selected.get("lithuania"):
+        if progress_callback:
+            progress_callback("🇱🇹 Searching Lithuania...", done/total)
+        results["lithuania"] = search_lithuania_register(search_term)
+        done += 1
+
+    # Scotland
+    if selected.get("scotland"):
+        if progress_callback:
+            progress_callback("🏴󠁧󠁢󠁳󠁣󠁴󠁿 Searching Scotland...", done/total)
+        results["scotland"] = search_scotland_register(search_term)
+        done += 1
+
     if progress_callback:
         progress_callback("✅ Complete!", 1.0)
-    
+
     return results
 
 
@@ -955,7 +1000,78 @@ def display_summary(search_term: str, results: dict):
                     st.write(f"• {minister}: {count} appointments")
             
             st.caption(f"⚠️ Data is voluntary and may be incomplete | 📅 {data.get('data_coverage', '2023-present')}")
-    
+
+    # Latvia
+    if results.get("latvia"):
+        data = results["latvia"]
+        with st.expander("🇱🇻 **Latvia (Interest Representatives Register)** ✅", expanded=True):
+            entries = data.get("entries", [])
+            cols = st.columns(3)
+            with cols[0]:
+                st.metric("Registrants", data.get("entry_count", len(entries)))
+            with cols[1]:
+                st.metric("Total in Register", data.get("total_registered", "—"))
+            with cols[2]:
+                by_form = data.get("by_legal_form", {})
+                st.metric("Legal Forms", len(by_form))
+
+            if entries:
+                st.write("**Matching registrants:**")
+                for entry in entries[:10]:
+                    reg = entry.get("registration_number", "")
+                    reg_str = f" ({reg})" if reg else ""
+                    legal_form = entry.get("legal_form", "")
+                    form_str = f" · {legal_form}" if legal_form else ""
+                    st.write(f"• {entry['name']}{reg_str}{form_str}")
+
+            st.caption(f"📅 {data.get('data_coverage', '2025-present')} | ⚠️ {data.get('note', '')}")
+
+    # Lithuania
+    if results.get("lithuania"):
+        data = results["lithuania"]
+        with st.expander("🇱🇹 **Lithuania (VTEK Lobbyist Register)** ✅", expanded=True):
+            entries = data.get("entries", [])
+            cols = st.columns(2)
+            with cols[0]:
+                st.metric("Lobbyists Matched", data.get("entry_count", len(entries)))
+            with cols[1]:
+                st.metric("Total Registered", data.get("total_registered", "—"))
+
+            if entries:
+                st.write("**Matching lobbyists:**")
+                for entry in entries[:10]:
+                    employer = entry.get("employer", "")
+                    employer_str = f" — {employer}" if employer else ""
+                    client = entry.get("client", "")
+                    client_str = f" (client: {client})" if client else ""
+                    st.write(f"• {entry['name']}{employer_str}{client_str}")
+
+            st.caption(f"📅 {data.get('data_coverage', '2001-present')} | ⚠️ {data.get('note', '')}")
+
+    # Scotland
+    if results.get("scotland"):
+        data = results["scotland"]
+        with st.expander("🏴󠁧󠁢󠁳󠁣󠁴󠁿 **Scotland (Lobbying Register)** ✅", expanded=True):
+            entries = data.get("entries", [])
+            cols = st.columns(2)
+            with cols[0]:
+                st.metric("Registrants", data.get("entry_count", len(entries)))
+            with cols[1]:
+                st.metric("Total Returns", data.get("total_returns", 0))
+
+            if entries:
+                st.write("**Matching registrants:**")
+                for entry in entries[:10]:
+                    returns = entry.get("returns_count", 0)
+                    url = entry.get("detail_url", "")
+                    returns_str = f" ({returns} returns)" if returns else ""
+                    if url:
+                        st.markdown(f"• [{entry['name']}]({url}){returns_str}")
+                    else:
+                        st.write(f"• {entry['name']}{returns_str}")
+
+            st.caption(f"📅 {data.get('data_coverage', '2018-present')} | {data.get('note', '')}")
+
     # Not found
     for jur_id in not_found:
         if jur_id in JURISDICTIONS:
@@ -984,6 +1100,9 @@ def preview_matches(search_term: str, selected: dict, progress_callback=None, uk
         "catalonia": None,
         "finland": None,
         "slovenia": None,
+        "latvia": None,
+        "lithuania": None,
+        "scotland": None,
     }
     
     total = sum(selected.values())
@@ -1084,6 +1203,27 @@ def preview_matches(search_term: str, selected: dict, progress_callback=None, uk
         matches["slovenia"] = search_slovenia_register(search_term)
         done += 1
 
+    # Latvia - returns full data
+    if selected.get("latvia") and not meetings_only_mode:
+        if progress_callback:
+            progress_callback("🇱🇻 Searching Latvia...", done/total)
+        matches["latvia"] = search_latvia_register(search_term)
+        done += 1
+
+    # Lithuania - returns full data
+    if selected.get("lithuania") and not meetings_only_mode:
+        if progress_callback:
+            progress_callback("🇱🇹 Searching Lithuania...", done/total)
+        matches["lithuania"] = search_lithuania_register(search_term)
+        done += 1
+
+    # Scotland - returns full data
+    if selected.get("scotland") and not meetings_only_mode:
+        if progress_callback:
+            progress_callback("🏴󠁧󠁢󠁳󠁣󠁴󠁿 Searching Scotland...", done/total)
+        matches["scotland"] = search_scotland_register(search_term)
+        done += 1
+
     # MEP meetings - search across all modes
     if progress_callback:
         progress_callback("🇪🇺 Searching MEP meetings (Integrity Watch)...", done/total)
@@ -1118,6 +1258,9 @@ def fetch_selected_data(selections: dict, other_results: dict, progress_callback
         "catalonia": None,
         "finland": None,
         "slovenia": None,
+        "latvia": None,
+        "lithuania": None,
+        "scotland": None,
         "_warnings": [],
     }
 
@@ -1141,7 +1284,13 @@ def fetch_selected_data(selections: dict, other_results: dict, progress_callback
         results["finland"] = other_results.get("finland")
     if selections.get("slovenia"):
         results["slovenia"] = other_results.get("slovenia")
-    
+    if selections.get("latvia"):
+        results["latvia"] = other_results.get("latvia")
+    if selections.get("lithuania"):
+        results["lithuania"] = other_results.get("lithuania")
+    if selections.get("scotland"):
+        results["scotland"] = other_results.get("scotland")
+
     total = len(selections.get("eu", [])) + len(selections.get("france", [])) + len(selections.get("germany", []))
     if total == 0:
         return results
@@ -1723,7 +1872,40 @@ if st.session_state.matches and st.session_state.search_term_used:
                 key="slovenia_include"
             )
             user_selections["slovenia"] = slo_include
-    
+
+    # Latvia matches
+    if matches.get("latvia") and matches["latvia"].get("entries"):
+        lv_data = matches["latvia"]
+        with st.expander(f"🇱🇻 **Latvia** - {lv_data['entry_count']} entries found", expanded=True):
+            lv_include = st.checkbox(
+                f"Include Latvia ({lv_data['entry_count']} registrants)",
+                value=True,
+                key="latvia_include"
+            )
+            user_selections["latvia"] = lv_include
+
+    # Lithuania matches
+    if matches.get("lithuania") and matches["lithuania"].get("entries"):
+        lt_data = matches["lithuania"]
+        with st.expander(f"🇱🇹 **Lithuania** - {lt_data['entry_count']} entries found", expanded=True):
+            lt_include = st.checkbox(
+                f"Include Lithuania ({lt_data['entry_count']} lobbyists)",
+                value=True,
+                key="lithuania_include"
+            )
+            user_selections["lithuania"] = lt_include
+
+    # Scotland matches
+    if matches.get("scotland") and matches["scotland"].get("entries"):
+        sc_data = matches["scotland"]
+        with st.expander(f"🏴󠁧󠁢󠁳󠁣󠁴󠁿 **Scotland** - {sc_data['entry_count']} entries found", expanded=True):
+            sc_include = st.checkbox(
+                f"Include Scotland ({sc_data['entry_count']} registrants, {sc_data.get('total_returns', 0)} total returns)",
+                value=True,
+                key="scotland_include"
+            )
+            user_selections["scotland"] = sc_include
+
     # Show jurisdictions with no matches (skip in minister/topic mode since only UK+EC are searched)
     is_meetings_only_mode = st.session_state.get("search_mode") in ("Minister / Official", "Topic / Subject", "Department / DG")
     no_matches = []
@@ -1746,6 +1928,12 @@ if st.session_state.matches and st.session_state.search_term_used:
             no_matches.append("🇫🇮 Finland")
         if st.session_state.selected_jurisdictions.get("slovenia") and not (matches.get("slovenia") and matches["slovenia"].get("entries")):
             no_matches.append("🇸🇮 Slovenia")
+        if st.session_state.selected_jurisdictions.get("latvia") and not (matches.get("latvia") and matches["latvia"].get("entries")):
+            no_matches.append("🇱🇻 Latvia")
+        if st.session_state.selected_jurisdictions.get("lithuania") and not (matches.get("lithuania") and matches["lithuania"].get("entries")):
+            no_matches.append("🇱🇹 Lithuania")
+        if st.session_state.selected_jurisdictions.get("scotland") and not (matches.get("scotland") and matches["scotland"].get("entries")):
+            no_matches.append("🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scotland")
     if st.session_state.selected_jurisdictions.get("uk") and not (matches.get("uk") and matches["uk"].get("meetings")):
         no_matches.append("🇬🇧 UK")
     
