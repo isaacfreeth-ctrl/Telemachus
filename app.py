@@ -1105,15 +1105,21 @@ def preview_matches(search_term: str, selected: dict, progress_callback=None, uk
         "scotland": None,
     }
     
-    total = sum(selected.values())
-    done = 0
-    
     # In minister search mode, only search UK meetings and EC meetings
     # In topic search mode, only search UK meetings and EC meetings (by subject)
     minister_mode = search_field == "minister"
     topic_mode = search_field == "topic"
     department_mode = search_field == "department"
     meetings_only_mode = minister_mode or topic_mode or department_mode
+
+    # Count searches that will actually run, so progress stays in [0, 1].
+    # MEP meetings always runs; EC meetings only runs in meetings-only modes.
+    # In meetings-only modes, non-UK jurisdiction checkboxes are ignored.
+    if meetings_only_mode:
+        total = (1 if selected.get("uk") else 0) + 1 + 1  # UK + EC + MEP
+    else:
+        total = sum(selected.values()) + 1  # selected jurisdictions + MEP
+    done = 0
     
     # EU - just get matches, don't fetch full data
     if selected.get("eu") and not meetings_only_mode:
@@ -1535,7 +1541,7 @@ if search_button and search_term:
         
         def update_progress(msg, pct):
             status_text.text(msg)
-            progress_bar.progress(pct)
+            progress_bar.progress(max(0.0, min(1.0, pct)))
         
         # Convert UK date filter to months_back
         uk_months_map = {
@@ -1977,7 +1983,7 @@ if st.session_state.matches and st.session_state.search_term_used:
         
         def update_progress(msg, pct):
             status_text.text(msg)
-            progress_bar.progress(pct)
+            progress_bar.progress(max(0.0, min(1.0, pct)))
         
         # Stage 2: Fetch full data for selections
         st.session_state.final_results = fetch_selected_data(
