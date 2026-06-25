@@ -70,7 +70,7 @@ from openpyxl.utils import get_column_letter
 
 # Boolean search support
 try:
-    from boolean_search import boolean_match, is_boolean_query, parse_boolean_query
+    from boolean_search import boolean_match, is_boolean_query, parse_boolean_query, is_or_query, extract_or_terms, topic_match
     print("DEBUG: boolean_search module loaded successfully")
 except ImportError as e:
     print(f"ERROR: Could not import boolean_search: {e}")
@@ -1571,8 +1571,11 @@ def search_uk_index(search_term: str, months_back: int = None, search_field: str
             if not boolean_match(search_term, field_value):
                 continue
         elif search_field == "topic":
-            # Word-boundary matching for topic search to avoid "age" matching "management"
-            if not re.search(r'\b' + re.escape(search_lower) + r'\b', field_value.lower()):
+            # Word-order-insensitive, variant-aware topic matching (gap 7):
+            # catches "children's safety online" for "online safety", "tik tok" for
+            # "tiktok", and refuses bare "x" false-matches on SpaceX/Entity X. Still
+            # avoids "age" matching "management" because it matches whole tokens.
+            if not topic_match(search_term, field_value):
                 continue
         else:
             if search_lower not in field_value.lower():
