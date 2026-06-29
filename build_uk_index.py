@@ -46,12 +46,22 @@ from datetime import datetime, date
 from collections import defaultdict
 from urllib.parse import quote, unquote
 
+# Use the OS trust store for TLS where available. On machines behind a
+# TLS-inspection proxy (corporate AV / gateway), the injected root CA lives in the
+# Windows cert store but NOT in certifi's bundle, so requests would otherwise fail
+# with CERTIFICATE_VERIFY_FAILED and the whole scrape would silently return zero.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 # GOV.UK API endpoints
 GOVUK_SEARCH_URL = "https://www.gov.uk/api/search.json"
 GOVUK_CONTENT_URL = "https://www.gov.uk/api/content"
 
 # Rate limiting
-REQUEST_DELAY = 0.3  # seconds between requests to be polite
+REQUEST_DELAY = 0.15  # seconds between requests (polite; GOV.UK handles this easily)
 
 # Starmer-era cutoff (gap 10): meetings on/after this date are tagged starmer_era=True.
 # Kept as a *flag*, never a hard drop, since prior-role rows are wanted for some analyses.
@@ -281,6 +291,12 @@ def normalize_date(date_str: str, fallback_year: str = "") -> str:
 
     date_str = date_str.strip()
 
+    # Strip a trailing time component (spreadsheet cells arrive as datetimes,
+    # e.g. "2015-09-01 00:00:00" or "01/09/2015T00:00:00").
+    m_dt = re.match(r'^(.*?)[ T]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?$', date_str)
+    if m_dt:
+        date_str = m_dt.group(1).strip()
+
     MONTHS = {
         'january': '01', 'february': '02', 'march': '03', 'april': '04',
         'may': '05', 'june': '06', 'july': '07', 'august': '08',
@@ -323,6 +339,11 @@ def normalize_date(date_str: str, fallback_year: str = "") -> str:
     if m:
         return f"01/{int(m.group(2)):02d}/{m.group(1)}"
 
+    # Mon-YYYY format: "Sep-2015", "Jul-2014" (and "Sep 2015")
+    m = re.match(r'^(\w{3,})[-\s](\d{4})$', date_str)
+    if m and m.group(1).lower() in MONTHS:
+        return f"01/{MONTHS[m.group(1).lower()]}/{m.group(2)}"
+
     # Mon-YY format: "Nov-16", "Mar-17", "Oct-10"
     m = re.match(r'^(\w{3,})-(\d{2})$', date_str)
     if m:
@@ -363,69 +384,120 @@ def normalize_column_key(key: str) -> str:
 # ---------------------------------------------------------------------------
 # Publication discovery (gaps 1 + 2).
 # ---------------------------------------------------------------------------
+def _page_search(params, seen_links, publications, cap=1000):
+    """
+    Page through one Search API query into (seen_links, publications), respecting
+    the API's ~1000-offset hard cap. Returns (added_count, reported_total).
+    """
+    page_size = 100
+    added = 0
+    reported_total = 0
+    start = 0
+    while True:
+        try:
+            r = requests.get(GOVUK_SEARCH_URL, params={
+                **params, 'count': page_size, 'start': start,
+                'fields': 'link,title,public_timestamp',
+            }, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"    Search API error at offset {start} ({params.get('filter_organisations','*')}): {e}")
+            break
+        results = data.get('results', [])
+        if not results:
+            break
+        reported_total = max(reported_total, data.get('total', 0))
+        for res in results:
+            link = res.get('link', '')
+            title = res.get('title', '')
+            if link and title and link not in seen_links:
+                seen_links.add(link)
+                publications.append({
+                    'link': link, 'title': title,
+                    'timestamp': res.get('public_timestamp', ''),
+                })
+                added += 1
+        start += page_size
+        if start >= data.get('total', 0) or start >= cap:
+            break
+        time.sleep(REQUEST_DELAY)
+    return added, reported_total
+
+
+def _facet_organisations(query, max_facets=400):
+    """
+    Return [(slug, doc_count)] for every organisation that has transparency
+    publications matching `query`. One request; used to partition discovery so no
+    single sub-query ever hits the 1000-offset cap (gap 1, exhaustive coverage).
+    """
+    try:
+        r = requests.get(GOVUK_SEARCH_URL, params={
+            'filter_format': 'transparency', 'q': query,
+            'count': 0, 'facet_organisations': max_facets,
+        }, timeout=30)
+        r.raise_for_status()
+        opts = r.json().get('facets', {}).get('organisations', {}).get('options', [])
+    except Exception as e:
+        print(f"    Facet error: {e}")
+        return []
+    out = []
+    for o in opts:
+        slug = (o.get('value') or {}).get('slug', '')
+        if slug:
+            out.append((slug, o.get('documents', 0)))
+    return out
+
+
 def discover_publications(query, label=""):
     """
-    Discover transparency publications from the GOV.UK Search API.
+    Discover transparency publications from the GOV.UK Search API, EXHAUSTIVELY.
 
-    Gap 1: the Search API hard-caps at 1000 results per query and the old code
-    silently stopped there. We now page through BOTH timestamp orderings (newest
-    and oldest first) so a >1000-result series is covered from both ends, dedupe
-    by link, and LOUDLY warn if the reported total still exceeds what we fetched.
+    The Search API hard-caps paging at ~1000 results per query, so a single broad
+    query (e.g. "ministerial meetings" = 5,400+ hits) silently loses everything
+    past the cap — which is what gutted 2015-2024 coverage in the first rebuild.
+
+    Fix (gap 1, done properly): partition by organisation. `facet_organisations`
+    lists every department with matching transparency pubs and their counts; the
+    busiest (Cabinet Office) has only ~270, far under the cap. We page each org
+    separately and union, so nothing is capped out. A global both-orderings pass
+    is added as a safety net for any publication with no organisation facet, and
+    any org that still exceeds the cap is reported loudly.
     """
     seen_links = set()
     publications = []
-    reported_total = 0
-    page_size = 100
 
-    print(f"  Discovering {label} publications...")
+    print(f"  Discovering {label} publications (partitioned by organisation)...")
 
-    for order in ('-public_timestamp', 'public_timestamp'):
-        start = 0
-        while True:
-            try:
-                r = requests.get(GOVUK_SEARCH_URL, params={
-                    'filter_format': 'transparency',
-                    'q': query,
-                    'count': page_size,
-                    'start': start,
-                    'order': order,
-                    'fields': 'link,title,public_timestamp'
-                }, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-            except Exception as e:
-                print(f"    Search API error at offset {start} (order={order}): {e}")
-                break
+    # Safety-net global pass (both orderings) catches org-less publications.
+    _, total_newest = _page_search(
+        {'filter_format': 'transparency', 'q': query, 'order': '-public_timestamp'},
+        seen_links, publications)
+    _page_search(
+        {'filter_format': 'transparency', 'q': query, 'order': 'public_timestamp'},
+        seen_links, publications)
 
-            results = data.get('results', [])
-            if not results:
-                break
+    # Per-organisation partition: this is what makes coverage complete.
+    orgs = _facet_organisations(query)
+    print(f"    {len(orgs)} organisations have matching transparency publications "
+          f"(reported total {total_newest})")
+    capped = []
+    for slug, count in orgs:
+        _, org_total = _page_search(
+            {'filter_format': 'transparency', 'q': query,
+             'filter_organisations': slug, 'order': '-public_timestamp'},
+            seen_links, publications)
+        if org_total > 1000:
+            # Extremely unlikely for a single org, but never hide it.
+            capped.append((slug, org_total))
+        time.sleep(REQUEST_DELAY)
 
-            reported_total = max(reported_total, data.get('total', 0))
-
-            for res in results:
-                link = res.get('link', '')
-                title = res.get('title', '')
-                if link and title and link not in seen_links:
-                    seen_links.add(link)
-                    publications.append({
-                        'link': link,
-                        'title': title,
-                        'timestamp': res.get('public_timestamp', '')
-                    })
-
-            start += page_size
-            if start >= data.get('total', 0) or start >= 1000:  # API hard cap
-                break
-            time.sleep(REQUEST_DELAY)
-
-    print(f"    Found {len(publications)} publications (API reported total: {reported_total})")
-    if reported_total > len(publications):
-        print(f"    *** WARNING: GOV.UK reports {reported_total} results but only "
-              f"{len(publications)} were retrievable via paging. The Search API caps at "
-              f"1000 per ordering — narrow the query or rely on collection pages "
-              f"(see discover_from_collections) to close the gap. ***")
-    return publications, reported_total
+    print(f"    Found {len(publications)} unique publications across "
+          f"{len(orgs)} organisations")
+    if capped:
+        print(f"    *** WARNING: {len(capped)} organisation(s) exceed the 1000 cap "
+              f"and need year-window sub-partitioning: {capped[:5]} ***")
+    return publications, total_newest
 
 
 def discover_from_collections(collection_paths=KNOWN_COLLECTION_PATHS):
@@ -566,6 +638,64 @@ def is_meetings_attachment(filename: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Gap 10: canonical department. Source-published labels fragment badly
+# ("DCMS" vs "Dcms Ministers Gifts Hospitality Travel And Meetings"), defeating
+# per-department grouping. We map every row to a stable canonical department,
+# keyed primarily off the publication URL slug (reliable) then the label text.
+# Each rule: (canonical, [phrase substrings], [exact slug/word tokens]).
+# Ordered most-specific-first so e.g. DESNZ wins over a bare "energy".
+# ---------------------------------------------------------------------------
+DEPT_RULES = [
+    ("DSIT", ["science-innovation-and-technology", "science, innovation"], ["dsit"]),
+    ("DESNZ", ["energy-security-and-net-zero", "energy security and net zero"], ["desnz"]),
+    ("DBT", ["business-and-trade", "department for business and trade"], ["dbt"]),
+    ("DIT", ["international-trade", "international trade"], ["dit"]),
+    ("BEIS", ["business-energy-and-industrial-strategy", "business, energy"], ["beis"]),
+    ("BIS", ["business-innovation-and-skills", "business, innovation and skills"], ["bis"]),
+    ("DHSC", ["health-and-social-care", "department of health"], ["dhsc"]),
+    ("DfT", ["department-for-transport", "department for transport"], ["dft"]),
+    ("DfE", ["department-for-education", "department for education"], ["dfe"]),
+    ("MHCLG", ["housing-communities-and-local-government", "levelling-up-housing-and-communities",
+               "communities-and-local-government", "housing, communities"], ["mhclg", "dluhc", "dclg"]),
+    ("FCDO", ["foreign-commonwealth-development", "foreign, commonwealth"], ["fcdo"]),
+    ("DFID", ["international-development", "international development"], ["dfid"]),
+    ("FCO", ["foreign-and-commonwealth-office", "foreign office"], ["fco"]),
+    ("MOD", ["ministry-of-defence", "ministry of defence"], ["mod"]),
+    ("DWP", ["work-and-pensions", "work and pensions"], ["dwp"]),
+    ("Defra", ["environment-food-rural-affairs", "environment, food"], ["defra"]),
+    ("DCMS", ["digital-culture-media-and-sport", "culture-media-and-sport", "culture, media"], ["dcms"]),
+    ("MOJ", ["ministry-of-justice", "ministry of justice"], ["moj"]),
+    ("HM Treasury", ["hm-treasury", "hm treasury"], ["hmt", "treasury"]),
+    ("HMRC", ["hm-revenue-customs", "revenue-and-customs", "revenue & customs"], ["hmrc"]),
+    ("Home Office", ["home-office", "home office"], []),
+    ("NIO", ["northern-ireland-office", "northern ireland office"], ["nio"]),
+    ("Scotland Office", ["secretary-of-state-for-scotland", "scotland-office", "scotland office"], []),
+    ("Wales Office", ["secretary-of-state-for-wales", "wales-office", "wales office"], []),
+    ("DExEU", ["exiting-the-european-union", "department for exiting"], ["dexeu"]),
+    ("Attorney General", ["attorney-general", "attorney general"], ["ago"]),
+    ("GLD", ["government-legal-department", "treasury-solicitor"], ["gld"]),
+    ("UKEF", ["uk-export-finance", "export finance"], ["ukef"]),
+    ("Leader of the House of Commons", ["leader-of-the-house-of-commons"], []),
+    ("Leader of the House of Lords", ["leader-of-the-house-of-lords"], []),
+    ("Prime Minister's Office", ["prime-ministers-office", "10-downing-street", "number-10", "no10"], []),
+    ("Cabinet Office", ["cabinet-office", "cabinet office"], ["co"]),
+]
+
+
+def canonical_department(label="", source_url=""):
+    """Map a row's (label, source_url) to a stable canonical department, or '' if unknown."""
+    slug = (source_url or "").rstrip("/").split("/")[-1].lower()
+    text = f"{slug} {(label or '').lower()}"
+    tokens = set(re.split(r'[^a-z0-9]+', text))
+    for canonical, phrases, codes in DEPT_RULES:
+        if any(p in text for p in phrases):
+            return canonical
+        if any(c in tokens for c in codes):
+            return canonical
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Row extraction shared between CSV and XLSX parsers (gaps 4, 5, 10).
 # ---------------------------------------------------------------------------
 NIL_VALUES = {'nil', 'nil return', 'no meetings', 'none', 'n/a', 'no meetings held',
@@ -675,6 +805,7 @@ def _process_row(row_lower, department, meeting_type, source_url, source_attachm
         "organisation": org,
         "purpose": purpose,
         "department": department,
+        "department_canonical": canonical_department(department, source_url) or department,
         "meeting_type": meeting_type,
         "starmer_era": starmer_era,
         "source_url": source_url,
@@ -682,11 +813,45 @@ def _process_row(row_lower, department, meeting_type, source_url, source_attachm
     }
 
 
-def _detect_meeting_type(headers_lower, default="ministerial"):
-    headers_str = " ".join(headers_lower)
-    if any(kw in headers_str for kw in ["permanent secretary", "senior official", "director general"]):
+def classify_meeting_type(headers_lower=None, filename="", source_url="", fallback="ministerial"):
+    """
+    Decide ministerial vs senior_official from the strongest available signal.
+
+    The earlier detector only ever flipped *toward* senior_official, so once a
+    publication matched the "senior officials" discovery query (and was tagged
+    'both'), every row in it — including obviously ministerial files like
+    'dhsc-ministerial-meetings...' — was mislabelled senior. This classifier is
+    bidirectional and prefers the explicit role wording in the attachment
+    filename / URL, then the CSV column headers (which name the attendee's role),
+    and only falls back to the publication-level guess when truly ambiguous.
+    """
+    def _norm(s):
+        return re.sub(r'[_\-]+', ' ', (s or '').lower())
+
+    text = _norm(f"{filename} {source_url}")
+    senior_sig = (
+        'senior official' in text or 'permanent secretar' in text
+        or 'director general' in text or bool(re.search(r'\bofficials?\b', text))
+    )
+    minister_sig = bool(re.search(r'\bminister', text))  # minister/ministers/ministerial
+
+    if senior_sig and not minister_sig:
         return "senior_official"
-    return default
+    if minister_sig and not senior_sig:
+        return "ministerial"
+
+    # Filename ambiguous or conflicting -> use the column headers.
+    if headers_lower:
+        hs = _norm(" ".join(headers_lower))
+        senior_hdr = ('permanent secretar' in hs or 'senior official' in hs
+                      or 'director general' in hs)
+        minister_hdr = 'minister' in hs
+        if senior_hdr and not minister_hdr:
+            return "senior_official"
+        if minister_hdr and not senior_hdr:
+            return "ministerial"
+
+    return fallback if fallback in ("ministerial", "senior_official") else "ministerial"
 
 
 def fetch_attachment_bytes(url):
@@ -701,28 +866,100 @@ def fetch_attachment_bytes(url):
         return None, str(e)
 
 
+def _emit_rows(records, headers, department, meeting_type, source_url,
+               source_attachment, fallback_year, period_start, period_end):
+    """Shared tail: classify type from headers, run each row through _process_row."""
+    meetings, nils = [], []
+    headers_lower = [normalize_column_key(h) for h in headers if h]
+    meeting_type = classify_meeting_type(headers_lower, source_attachment,
+                                         source_url, meeting_type)
+    for row_lower in records:
+        kind, rec = _process_row(row_lower, department, meeting_type, source_url,
+                                 source_attachment, fallback_year,
+                                 period_start, period_end)
+        if kind == 'meeting':
+            meetings.append(rec)
+        elif kind == 'nil':
+            nils.append(rec)
+    return meetings, nils
+
+
 def parse_csv_bytes(content_bytes, department, meeting_type, source_url,
                     source_attachment, fallback_year, period_start, period_end):
     """Parse meeting + nil rows from CSV bytes. Returns (meetings, nils, error)."""
-    meetings, nils = [], []
     try:
         content = content_bytes.decode('utf-8-sig', errors='replace')
         reader = csv.DictReader(io.StringIO(content))
-        if reader.fieldnames:
-            headers_lower = [normalize_column_key(h) for h in reader.fieldnames if h]
-            meeting_type = _detect_meeting_type(headers_lower, meeting_type)
-        for row in reader:
-            row_lower = {normalize_column_key(k): (v.strip() if v else '')
-                         for k, v in row.items() if k}
-            kind, rec = _process_row(row_lower, department, meeting_type, source_url,
-                                     source_attachment, fallback_year,
-                                     period_start, period_end)
-            if kind == 'meeting':
-                meetings.append(rec)
-            elif kind == 'nil':
-                nils.append(rec)
+        headers = reader.fieldnames or []
+        records = [{normalize_column_key(k): (v.strip() if v else '')
+                    for k, v in row.items() if k} for row in reader]
+        meetings, nils = _emit_rows(records, headers, department, meeting_type, source_url,
+                                    source_attachment, fallback_year, period_start, period_end)
+        return meetings, nils, None
     except Exception as e:
-        return meetings, nils, f"Parse error: {e}"
+        # Malformed CSV (e.g. literal newlines in unquoted fields): retry via pandas.
+        m, n, perr = parse_with_pandas(content_bytes, 'csv', department, meeting_type,
+                                       source_url, source_attachment, fallback_year,
+                                       period_start, period_end)
+        if perr:
+            return [], [], f"Parse error: {e}"
+        return m, n, None
+
+
+def parse_with_pandas(content_bytes, ext, department, meeting_type, source_url,
+                      source_attachment, fallback_year, period_start, period_end):
+    """
+    Parse ODS / XLS / XLSX (and as a CSV fallback) via pandas, which has the
+    engines for each format (odf, xlrd, openpyxl). Reads every sheet. Returns
+    (meetings, nils, error). This is what recovers the ~1,100 ODS files and the
+    old-binary .xls returns the openpyxl-only path could not read.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return [], [], "pandas unavailable"
+    engine = {'ods': 'odf', 'xls': 'xlrd', 'xlsx': 'openpyxl'}.get(ext)
+    try:
+        if ext == 'csv':
+            # header=None so we can find the real header row ourselves.
+            frames = {0: pd.read_csv(io.BytesIO(content_bytes), dtype=str, header=None,
+                                     engine='python', on_bad_lines='skip')}
+        else:
+            frames = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None,
+                                   dtype=str, header=None, engine=engine)
+    except Exception as e:
+        return [], [], f"{ext} parse error: {e}"
+
+    HEADER_HINTS = ("date", "minister", "organisation", "senior official",
+                    "permanent secretary", "purpose", "name of")
+    meetings, nils = [], []
+    for df in frames.values():
+        if df is None or df.empty:
+            continue
+        grid = df.values.tolist()
+        # Locate the header row: the first row naming a date/minister/org/purpose column.
+        header_idx = None
+        for i, raw in enumerate(grid[:25]):
+            cells = " ".join(normalize_column_key(str(c)) for c in raw if c is not None)
+            if any(h in cells for h in HEADER_HINTS):
+                header_idx = i
+                break
+        if header_idx is None:
+            continue
+        headers = [str(c) if c is not None else "" for c in grid[header_idx]]
+        keys = [normalize_column_key(h) for h in headers]
+        records = []
+        for raw in grid[header_idx + 1:]:
+            rl = {}
+            for j, val in enumerate(raw):
+                if j < len(keys) and keys[j]:
+                    v = '' if (val is None or pd.isna(val)) else str(val).strip()
+                    rl[keys[j]] = '' if v.lower() in ('nan', 'nat') else v
+            records.append(rl)
+        m, n = _emit_rows(records, headers, department, meeting_type, source_url,
+                          source_attachment, fallback_year, period_start, period_end)
+        meetings.extend(m)
+        nils.extend(n)
     return meetings, nils, None
 
 
@@ -760,7 +997,8 @@ def parse_xlsx_bytes(content_bytes, department, meeting_type, source_url,
                                                  "senior official", "purpose"]):
                         header = keys
                         header_idx_map = keys
-                        meeting_type = _detect_meeting_type(keys, meeting_type)
+                        meeting_type = classify_meeting_type(keys, source_attachment,
+                                                             source_url, meeting_type)
                     continue
                 row_lower = {}
                 for i, val in enumerate(cells):
@@ -1025,7 +1263,11 @@ def build_index():
         if i % 25 == 0:
             print(f"  Processing attachment {i}/{len(unique_queue)}...")
 
-        meeting_type = "ministerial" if item['type'] == 'ministerial' else "senior_official"
+        # Pass the publication-level type as a fallback only; classify_meeting_type
+        # decides per-attachment from filename/headers (a 'both' pub is resolved
+        # per file, not blanket-labelled senior_official).
+        meeting_type = item['type'] if item['type'] in ('ministerial', 'senior_official') \
+            else 'ministerial'
         m_entry = item['manifest_entry']
 
         fallback_year = ""
@@ -1053,12 +1295,17 @@ def build_index():
             meetings, nils, perr = parse_csv_bytes(
                 content_bytes, item['dept'], meeting_type, item['pub_url'],
                 item['filename'], fallback_year, item['period_start'], item['period_end'])
-        elif item['ext'] in ('xlsx', 'xls'):
-            meetings, nils, perr = parse_xlsx_bytes(
-                content_bytes, item['dept'], meeting_type, item['pub_url'],
+        else:  # xlsx / xls / ods -> pandas (odf / xlrd / openpyxl engines)
+            meetings, nils, perr = parse_with_pandas(
+                content_bytes, item['ext'], item['dept'], meeting_type, item['pub_url'],
                 item['filename'], fallback_year, item['period_start'], item['period_end'])
-        else:  # ods — pandas needs odfpy which isn't a dependency; record, don't crash.
-            meetings, nils, perr = [], [], "ods_not_parsed (odfpy unavailable)"
+            if perr and item['ext'] == 'xlsx':
+                # Old-style .xls mislabelled .xlsx, or openpyxl-only quirk: last resort.
+                m2, n2, e2 = parse_xlsx_bytes(
+                    content_bytes, item['dept'], meeting_type, item['pub_url'],
+                    item['filename'], fallback_year, item['period_start'], item['period_end'])
+                if not e2:
+                    meetings, nils, perr = m2, n2, None
 
         if perr:
             download_errors.append((item['url'], perr))
@@ -1187,7 +1434,23 @@ def build_index():
     else:
         print(f"  Row-count assertion OK: manifest total == parsed rows ({manifest_row_total})")
 
-    # ---- Step 7: Save ----
+    # ---- Step 7: Save (with a guard against clobbering a good index) ----
+    # A failed scrape (e.g. TLS errors -> zero publications) must NEVER overwrite a
+    # healthy prior index with an empty or drastically smaller one. Abort instead.
+    prior_count = (prior_index or {}).get("metadata", {}).get("meeting_count", 0)
+    if len(raw_meetings) == 0 and prior_count > 0:
+        print()
+        print("*** ABORTING SAVE: parsed 0 meetings but the existing index has "
+              f"{prior_count}. This usually means discovery/download failed "
+              "(network/TLS). The existing index was left untouched. ***")
+        return None
+    if prior_count and len(raw_meetings) < 0.5 * prior_count and "--force" not in sys.argv:
+        print()
+        print(f"*** ABORTING SAVE: parsed {len(raw_meetings)} meetings, less than half "
+              f"the prior {prior_count}. This looks like a partial/failed run. The "
+              "existing index was left untouched. Re-run with --force to override. ***")
+        return None
+
     print(f"Step 7: Saving to {output_path}...")
     with gzip.open(output_path, "wt", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False)

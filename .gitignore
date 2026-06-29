@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build logs and scratch
+build_run*.log
+*.log
+
+# Index backups / scratch copies (the live index is committed; backups are not)
+new_index_*.json.gz
+old_index_*.json.gz
+
+# Editor / tooling
+.claude/
