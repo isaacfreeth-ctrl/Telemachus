@@ -731,6 +731,12 @@ def _process_row(row_lower, department, meeting_type, source_url, source_attachm
         row_lower.get("name", "") or
         ""
     ).strip()
+    if not minister:
+        # Annotated headers, e.g. DfE's "Senior Official's Name (PART OF GMPP)"
+        for k, v in row_lower.items():
+            if v and k.startswith(("senior official", "minister")) and "name" in k:
+                minister = v.strip()
+                break
 
     date_raw = (
         row_lower.get("date", "") or
@@ -895,6 +901,14 @@ def parse_csv_bytes(content_bytes, department, meeting_type, source_url,
                     for k, v in row.items() if k} for row in reader]
         meetings, nils = _emit_rows(records, headers, department, meeting_type, source_url,
                                     source_attachment, fallback_year, period_start, period_end)
+        if not meetings:
+            # Row 1 may not be the header (e.g. DfE templates put instructions above
+            # it). Retry via pandas, which scans for the real header row.
+            m, n, perr = parse_with_pandas(content_bytes, 'csv', department, meeting_type,
+                                           source_url, source_attachment, fallback_year,
+                                           period_start, period_end)
+            if not perr and m:
+                return m, n, None
         return meetings, nils, None
     except Exception as e:
         # Malformed CSV (e.g. literal newlines in unquoted fields): retry via pandas.
@@ -922,7 +936,11 @@ def parse_with_pandas(content_bytes, ext, department, meeting_type, source_url,
     try:
         if ext == 'csv':
             # header=None so we can find the real header row ourselves.
-            frames = {0: pd.read_csv(io.BytesIO(content_bytes), dtype=str, header=None,
+            try:
+                text = content_bytes.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                text = content_bytes.decode('cp1252', errors='replace')  # Excel "CSV" exports
+            frames = {0: pd.read_csv(io.StringIO(text), dtype=str, header=None,
                                      engine='python', on_bad_lines='skip')}
         else:
             frames = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None,
@@ -940,7 +958,11 @@ def parse_with_pandas(content_bytes, ext, department, meeting_type, source_url,
         # Locate the header row: the first row naming a date/minister/org/purpose column.
         header_idx = None
         for i, raw in enumerate(grid[:25]):
-            cells = " ".join(normalize_column_key(str(c)) for c in raw if c is not None)
+            vals = [str(c) for c in raw if c is not None and not pd.isna(c)]
+            # Skip instruction blocks ("Date MUST be in the following format...")
+            if any(len(v) > 100 for v in vals):
+                continue
+            cells = " ".join(normalize_column_key(v) for v in vals)
             if any(h in cells for h in HEADER_HINTS):
                 header_idx = i
                 break
